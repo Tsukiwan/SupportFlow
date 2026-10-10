@@ -17,7 +17,10 @@ PostgreSQL:
   WHERE order_id = :id AND refunded_amount + reserved_amount + :amount
   <= total_amount``) plus row locking for reservation, release and settle;
 - a unique partial index or in-flight flag to block concurrent processing
-  of the same order (one unresolved refund per order: PENDING or UNKNOWN).
+  of the same order (one unresolved refund per order: PENDING or UNKNOWN);
+- the ticket-level claim cap (cumulative refunds <= ticket.claimed_amount,
+  over PROCESSED/PENDING/UNKNOWN records) as a constraint/aggregate over
+  the refunds table, so it also holds across processes and restarts.
 """
 
 import threading
@@ -28,8 +31,9 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from app.domain.enums import IssueType, RefundStatus
+from app.domain.enums import AgentRunStatus, IssueType, RefundStatus, TicketStatus
 from app.domain.models import (
+    AgentRun,
     Approval,
     AuditEvent,
     Order,
@@ -112,6 +116,7 @@ class RefundCreateOutcome(BaseModel):
         "conflict",
         "balance_exceeded",
         "already_refunded",
+        "claim_exceeded",
         "gateway_rejected",
     ]
     refund: Refund | None = None
@@ -154,10 +159,12 @@ class RefundStore:
         plan_id: str | None,
         run_id: str | None,
         reason: str,
+        ticket_claimed_amount: Decimal | None,
         now: datetime,
     ) -> RefundCreateOutcome:
-        """Atomic: idempotency lookup + in-flight check + balance reserve
-        + record insert. Returns the next step the service must take.
+        """Atomic: idempotency lookup + in-flight check + balance check +
+        ticket claim check + balance reserve + record insert. Returns the
+        next step the service must take.
 
         The idempotency key binds the full operation intent (order, amount,
         ticket, issue type and plan version) — a same-key call with any
@@ -171,6 +178,17 @@ class RefundStore:
         concurrent, and an UNKNOWN refund (the original operation must be
         resolved first) blocks them as unresolved. Same-key retries are
         matched before this scan and keep their status-query recovery path.
+
+        Ticket-level claim identity: one ticket carries one claim, and the
+        cumulative amount of all its refunds (settled, in-flight and
+        unresolved) plus this request must not exceed the ticket's claimed
+        amount. This check and the reservation below run inside the same
+        critical section, so concurrent runs for the same ticket cannot
+        both occupy the claim — a different plan id or idempotency key
+        does not bypass it. A ticket without a claim amount takes no
+        refunds (fail closed): the agent always validates claims before
+        proposing, so a claimless ticket at this point means a caller
+        bypassed the graph.
 
         The refund record is fully constructed and validated before any
         balance is reserved, so a construction failure cannot leak a
@@ -220,6 +238,31 @@ class RefundStore:
                 if order is not None and order.refunded_amount >= order.total_amount:
                     return RefundCreateOutcome(kind="already_refunded")
                 return RefundCreateOutcome(kind="balance_exceeded")
+
+            # Claim cap. Only settled, in-flight and unresolved refunds
+            # occupy the claim: FAILED/REJECTED refunds released their
+            # reservation and leave room for a legitimate retry.
+            claimed = (
+                ticket_claimed_amount
+                if ticket_claimed_amount is not None
+                else Decimal("0")
+            )
+            occupied = sum(
+                (
+                    r.amount
+                    for r in self._by_id.values()
+                    if r.ticket_id == ticket_id
+                    and r.status
+                    in (
+                        RefundStatus.PROCESSED,
+                        RefundStatus.PENDING,
+                        RefundStatus.UNKNOWN,
+                    )
+                ),
+                Decimal("0"),
+            )
+            if amount > claimed - occupied:
+                return RefundCreateOutcome(kind="claim_exceeded")
 
             # Construct and validate the record first: if this raises, no
             # reservation has been made yet.
@@ -275,18 +318,52 @@ class RefundStore:
             self._by_id[refund_id] = updated
             return updated
 
-    def reopen(self, refund_id: str, *, orders: OrderStore) -> Refund | None:
-        """Retry a transiently failed refund: atomically re-reserve the
-        balance and move the record back to PENDING."""
+    def reopen(
+        self,
+        refund_id: str,
+        *,
+        orders: OrderStore,
+        ticket_claimed_amount: Decimal | None,
+    ) -> tuple[Literal["reopened", "balance_exceeded", "claim_exceeded"], Refund | None]:
+        """Retry a transiently failed refund: atomically re-check the
+        ticket claim cap, re-reserve the balance and move the record back
+        to PENDING. The claim check counts only the ticket's
+        PROCESSED/PENDING/UNKNOWN records — the FAILED record being
+        reopened holds no reservation and is deliberately excluded, so a
+        retry of the original operation must fit on top of everything else
+        that currently occupies the claim. Nothing is reserved and no
+        state changes unless every check passes, so a refused reopen never
+        leaves a reservation behind and never reaches the gateway."""
         with self._lock:
             refund = self._by_id.get(refund_id)
             if refund is None or refund.status is not RefundStatus.FAILED:
-                return None
+                return "balance_exceeded", None
+            claimed = (
+                ticket_claimed_amount
+                if ticket_claimed_amount is not None
+                else Decimal("0")
+            )
+            occupied = sum(
+                (
+                    r.amount
+                    for r in self._by_id.values()
+                    if r.ticket_id == refund.ticket_id
+                    and r.status
+                    in (
+                        RefundStatus.PROCESSED,
+                        RefundStatus.PENDING,
+                        RefundStatus.UNKNOWN,
+                    )
+                ),
+                Decimal("0"),
+            )
+            if refund.amount > claimed - occupied:
+                return "claim_exceeded", None
             if orders.reserve(refund.order_id, refund.amount) is None:
-                return None
+                return "balance_exceeded", None
             updated = refund.model_copy(update={"status": RefundStatus.PENDING})
             self._by_id[refund_id] = updated
-            return updated
+            return "reopened", updated
 
 
 class TicketStore:
@@ -297,6 +374,45 @@ class TicketStore:
     def get(self, ticket_id: str) -> Ticket | None:
         with self._lock:
             return self._tickets.get(ticket_id)
+
+    def update_status(
+        self, ticket_id: str, status: TicketStatus, *, now: datetime
+    ) -> Ticket | None:
+        """Replace the ticket with a copy carrying the new status. The
+        agent layer is the only caller; tools never change ticket state."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                return None
+            updated = ticket.model_copy(
+                update={"status": status, "updated_at": now}
+            )
+            self._tickets[ticket_id] = updated
+            return updated
+
+    def transition_status(
+        self,
+        ticket_id: str,
+        status: TicketStatus,
+        *,
+        now: datetime,
+        allowed_from: tuple[TicketStatus, ...],
+    ) -> Ticket | None:
+        """Atomically move the ticket to ``status`` only if its current
+        status is one of ``allowed_from`` (guard checked and applied under
+        the same lock). Returns None and changes nothing when the guard
+        does not hold — callers use this so a concurrent run can never
+        pull a terminal ticket (RESOLVED/CLOSED) backwards to an earlier
+        state."""
+        with self._lock:
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None or ticket.status not in allowed_from:
+                return None
+            updated = ticket.model_copy(
+                update={"status": status, "updated_at": now}
+            )
+            self._tickets[ticket_id] = updated
+            return updated
 
 
 class TicketNoteStore:
@@ -355,3 +471,51 @@ class AuditStore:
     def all(self) -> tuple[AuditEvent, ...]:
         with self._lock:
             return tuple(self._events)
+
+
+class AgentRunStore:
+    """Bookkeeping for agent runs. ``update`` re-validates the frozen
+    ``AgentRun`` model, so an iteration count or terminal status that
+    violates the model constraints is rejected instead of persisted."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._runs: dict[str, AgentRun] = {}
+
+    def create(self, run: AgentRun) -> None:
+        with self._lock:
+            self._runs[run.run_id] = run
+
+    def get(self, run_id: str) -> AgentRun | None:
+        with self._lock:
+            return self._runs.get(run_id)
+
+    def all(self) -> tuple[AgentRun, ...]:
+        with self._lock:
+            return tuple(self._runs.values())
+
+    def update(
+        self,
+        run_id: str,
+        *,
+        status: AgentRunStatus | None = None,
+        iterations: int | None = None,
+        error: str | None = None,
+        finished_at: datetime | None = None,
+    ) -> AgentRun | None:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None:
+                return None
+            updates: dict = {}
+            if status is not None:
+                updates["status"] = status
+            if iterations is not None:
+                updates["iterations"] = iterations
+            if error is not None:
+                updates["error"] = error
+            if finished_at is not None:
+                updates["finished_at"] = finished_at
+            updated = run.model_copy(update=updates)  # re-validates constraints
+            self._runs[run_id] = updated
+            return updated

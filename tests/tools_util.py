@@ -33,6 +33,9 @@ def build_tool_set(
     orders=None,
     tickets=None,
     shipments=None,
+    # Defaults to None for Day 2 fixtures (hash-less approvals). Tests
+    # that exercise the Day 3 plan binding must pass a shared PlanStore.
+    plans=None,
 ) -> ToolSet:
     tool_set = ToolSet(
         orders=OrderStore(orders if orders is not None else build_orders_by_id()),
@@ -45,6 +48,7 @@ def build_tool_set(
         approvals=ApprovalStore(),
         gateway=gateway or SimulatedPaymentGateway(outcomes=gateway_outcomes),
         recorder=AuditRecorder(AuditStore()),
+        plans=plans,
     )
     for approval in approvals:
         tool_set.approvals.add(approval)

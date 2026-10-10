@@ -23,6 +23,7 @@ from app.persistence.memory_stores import (
 )
 from app.services.audit import AuditRecorder
 from app.services.payments import PaymentGateway, SimulatedPaymentGateway
+from app.services.plans import PlanStore
 from app.services.refund_policy import RefundPolicy, evaluate_refund_policy
 from app.services.refunds import RefundService
 from app.tools.audit import audited
@@ -52,6 +53,13 @@ class ToolSet:
         approvals: ApprovalStore,
         gateway: PaymentGateway,
         recorder: AuditRecorder,
+        # When present (always in production), approvals are re-verified
+        # against this trusted plan registry at refund execution time and
+        # an approval without a content hash fails closed. The default
+        # None exists only for Day 2 test fixtures: production wiring goes
+        # through build_default_tool_set / build_agent_wiring, which
+        # always pass a plan store.
+        plans: PlanStore | None = None,
     ) -> None:
         self.orders = orders
         self.refund_store = refunds
@@ -69,6 +77,7 @@ class ToolSet:
             approvals=approvals,
             gateway=gateway,
             recorder=recorder,
+            plans=plans,
         )
 
     @audited("get_order")
@@ -157,8 +166,18 @@ class ToolSet:
         return await self._refund_service.create(params, ctx)
 
 
-def build_default_tool_set(gateway: PaymentGateway | None = None) -> ToolSet:
-    """Assemble a tool set over the deterministic mock catalog."""
+def build_default_tool_set(
+    gateway: PaymentGateway | None = None,
+    *,
+    plans: PlanStore,
+) -> ToolSet:
+    """Assemble a tool set over the deterministic mock catalog.
+
+    ``plans`` is required: refunds must re-verify approvals against the
+    trusted plan registry (including the plan content hash) at execution
+    time, so the production construction always wires the shared plan
+    store. The hash-less, plans-less path exists only for Day 2 test
+    fixtures that build :class:`ToolSet` directly."""
     from app.persistence.mock_catalog import (
         build_orders_by_id,
         build_shipments_by_order_id,
@@ -175,4 +194,5 @@ def build_default_tool_set(gateway: PaymentGateway | None = None) -> ToolSet:
         approvals=ApprovalStore(),
         gateway=gateway or SimulatedPaymentGateway(),
         recorder=recorder,
+        plans=plans,
     )

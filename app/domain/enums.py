@@ -90,6 +90,9 @@ class AgentRunStatus(str, Enum):
     """Lifecycle of one agent run."""
 
     RUNNING = "running"
+    # The run paused at the human-approval gate. The ticket is pending
+    # approval, never resolved; a later run resumes once a decision exists.
+    AWAITING_APPROVAL = "awaiting_approval"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"

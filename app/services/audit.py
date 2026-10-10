@@ -34,6 +34,7 @@ class AuditRecorder:
         duration_ms: float | None = None,
         error_code: str | None = None,
         details: dict[str, Any] | None = None,
+        actor: str = "agent",
     ) -> None:
         extra: dict[str, Any] = dict(details or {})
         extra["outcome"] = outcome
@@ -44,7 +45,7 @@ class AuditRecorder:
         event = AuditEvent(
             event_id=f"EVT-{uuid4().hex[:12]}",
             timestamp=datetime.now(timezone.utc),
-            actor="agent",
+            actor=actor,
             action=tool,
             ticket_id=ctx.ticket_id if ctx else None,
             run_id=ctx.run_id if ctx else None,

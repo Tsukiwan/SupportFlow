@@ -12,15 +12,20 @@ Every check is independent of LLM judgement and of caller-provided state:
    the refund store;
 4. amount validity (positive, Decimal, at most 2 decimals) is enforced by
    ``CreateRefundInput`` before this service runs;
-5. when the policy requires approval, an APPROVED approval must exist for
-   the same ticket whose order, amount and plan version match exactly, at
-   least at the policy's required risk level, and within its validity
-   window (``expires_at``);
+5. approval is required whenever the effective risk demands it (the
+   higher of the ticket's risk level and the policy's required approval
+   level; HIGH-or-above always requires approval, independently of the
+   agent graph). An APPROVED approval must exist for the same ticket
+   whose order, amount, plan version and plan content hash match exactly
+   (a missing hash fails closed whenever a plan store is wired in), at
+   least at the effective risk level, and within its validity window
+   (``expires_at``);
 6. idempotency and concurrency are enforced by the refund store's atomic
    section, not by in-memory ifs; the idempotency key binds the full
-   operation intent, and an order with a PENDING or UNKNOWN refund takes
+   operation intent, an order with a PENDING or UNKNOWN refund takes
    no new refunds (different idempotency key) until the original
-   operation is settled.
+   operation is settled, and the ticket's cumulative refunds
+   (settled, in-flight and unresolved) may not exceed its claim.
 
 Gateway result semantics: an exception says nothing about whether the
 gateway executed the refund (a connection can drop after the money moved),
@@ -31,13 +36,13 @@ executed" and takes the recoverable-failure path. Cancellation is likewise
 treated as UNKNOWN, never as a definitive failure.
 
 Outcome categories map to distinct ToolErrorCodes: business rejection
-(POLICY_DENIED / AMOUNT_MISMATCH / ALREADY_REFUNDED / APPROVAL_* /
-IDEMPOTENCY_CONFLICT / TICKET_ORDER_MISMATCH / ISSUE_TYPE_MISMATCH /
-GATEWAY_REJECTED), transient failure (UPSTREAM_TIMEOUT /
-CONCURRENT_PROCESSING, both retryable), execution failure
-(INTERNAL_ERROR) and unknown outcome (UNKNOWN_OUTCOME, resolved by
-re-querying the gateway — never by assuming failure and creating a new
-refund).
+(POLICY_DENIED / AMOUNT_MISMATCH / ALREADY_REFUNDED / CLAIM_EXCEEDED /
+APPROVAL_* / IDEMPOTENCY_CONFLICT / TICKET_ORDER_MISMATCH /
+ISSUE_TYPE_MISMATCH / GATEWAY_REJECTED), transient failure
+(UPSTREAM_TIMEOUT / CONCURRENT_PROCESSING, both retryable), execution
+failure (INTERNAL_ERROR) and unknown outcome (UNKNOWN_OUTCOME, resolved
+by re-querying the gateway — never by assuming failure and creating a
+new refund).
 """
 
 import asyncio
@@ -52,9 +57,14 @@ from app.persistence.memory_stores import (
     RefundStore,
     TicketStore,
 )
+from app.services.approvals import latest_approval
 from app.services.audit import AuditRecorder
 from app.services.payments import GatewayOutcome, PaymentGateway
-from app.services.refund_policy import evaluate_refund_policy
+from app.services.plans import PlanStore
+from app.services.refund_policy import (
+    approval_requirement,
+    evaluate_refund_policy,
+)
 from app.tools.context import ToolContext
 from app.tools.result import ToolErrorCode, ToolResult
 from app.tools.schemas import CreateRefundInput
@@ -72,6 +82,7 @@ class RefundService:
         approvals: ApprovalStore,
         gateway: PaymentGateway,
         recorder: AuditRecorder,
+        plans: PlanStore | None = None,
     ) -> None:
         self._orders = orders
         self._refunds = refunds
@@ -79,6 +90,7 @@ class RefundService:
         self._approvals = approvals
         self._gateway = gateway
         self._recorder = recorder
+        self._plans = plans
 
     async def create(
         self, params: CreateRefundInput, ctx: ToolContext | None
@@ -127,9 +139,17 @@ class RefundService:
                 f"refund not allowed: {policy.reason}",
             )
 
-        if policy.requires_approval:
+        # The approval requirement is computed here from the trusted
+        # ticket record exactly as the agent graph computes it (shared
+        # function): effective risk = max(ticket risk, policy level), and
+        # HIGH-or-above always requires approval — independent of the
+        # graph, so callers that bypass it are still stopped.
+        effective_risk, requires_approval = approval_requirement(
+            ticket.risk_level, policy
+        )
+        if requires_approval:
             approval_check = self._verify_approval(
-                params, order, ticket_id, policy
+                params, order, ticket_id, effective_risk
             )
             if not approval_check.success:
                 return approval_check
@@ -155,6 +175,7 @@ class RefundService:
             plan_id=params.plan_id,
             run_id=ctx.run_id if ctx else None,
             reason=policy.reason,
+            ticket_claimed_amount=ticket.claimed_amount,
             now=now,
         )
         try:
@@ -173,6 +194,11 @@ class RefundService:
                 return ToolResult.error(
                     ToolErrorCode.ALREADY_REFUNDED,
                     "order has already been fully refunded",
+                )
+            if kind == "claim_exceeded":
+                return ToolResult.error(
+                    ToolErrorCode.CLAIM_EXCEEDED,
+                    "cumulative refunds for this ticket would exceed its claimed amount",
                 )
             if kind == "concurrent":
                 return ToolResult.error(
@@ -202,9 +228,16 @@ class RefundService:
             if kind == "needs_resolution":
                 return await self._resolve_unknown(outcome.refund)
             if kind == "retry":
-                reopened = self._refunds.reopen(
-                    outcome.refund.refund_id, orders=self._orders
+                reopen_kind, reopened = self._refunds.reopen(
+                    outcome.refund.refund_id,
+                    orders=self._orders,
+                    ticket_claimed_amount=ticket.claimed_amount,
                 )
+                if reopen_kind == "claim_exceeded":
+                    return ToolResult.error(
+                        ToolErrorCode.CLAIM_EXCEEDED,
+                        "cumulative refunds for this ticket would exceed its claimed amount",
+                    )
                 if reopened is None:
                     return ToolResult.error(
                         ToolErrorCode.AMOUNT_MISMATCH,
@@ -232,12 +265,13 @@ class RefundService:
         params: CreateRefundInput,
         order: Order,
         ticket_id: str,
-        policy,
+        effective_risk,
     ) -> ToolResult[Approval]:
         """Fail-closed approval gate. Only an APPROVED approval whose
-        order, amount and plan version match exactly, whose risk level is
-        at least the policy's required level, and which is still within its
-        validity window unlocks execution."""
+        order, amount, plan version and plan content match exactly, whose
+        risk level is at least the effective risk required for this refund
+        (ticket risk raised to the policy level), and which is still within
+        its validity window unlocks execution."""
         candidates = [
             a
             for a in self._approvals.all()
@@ -248,7 +282,7 @@ class RefundService:
                 ToolErrorCode.APPROVAL_REQUIRED,
                 "refund policy requires human approval; none was requested for this ticket",
             )
-        latest = max(candidates, key=lambda a: a.requested_at)
+        latest = latest_approval(candidates)
         if latest.status is ApprovalStatus.PENDING:
             return ToolResult.error(
                 ToolErrorCode.APPROVAL_REQUIRED,
@@ -287,11 +321,50 @@ class RefundService:
                 ToolErrorCode.APPROVAL_MISMATCH,
                 "approval plan version does not match the requested plan",
             )
-        if RISK_SEVERITY[latest.risk_level] < RISK_SEVERITY[policy.approval_risk_level]:
+        if RISK_SEVERITY[latest.risk_level] < RISK_SEVERITY[effective_risk]:
             return ToolResult.error(
                 ToolErrorCode.APPROVAL_MISMATCH,
                 "approval risk level is below the level required for this refund",
             )
+        # Plan-content binding: the approval must cover the exact content
+        # the human reviewed. Loaded from the trusted plan store (never
+        # from caller claims), with the hash re-verified on load. Whenever
+        # a plan store is wired in (always, in production) a missing hash
+        # fails closed — an approval that does not provably bind the
+        # registered plan never unlocks execution. The hash-less path is
+        # reachable only by Day 2 test fixtures built without a plan store.
+        if self._plans is not None:
+            if latest.plan_content_hash is None:
+                return ToolResult.error(
+                    ToolErrorCode.APPROVAL_MISMATCH,
+                    "approval carries no plan content hash; it cannot be "
+                    "verified against the registered plan",
+                )
+            stored = self._plans.load_verified(latest.plan_id)
+            if stored is None:
+                return ToolResult.error(
+                    ToolErrorCode.APPROVAL_MISMATCH,
+                    "approval references a plan that is not registered or "
+                    "whose content failed integrity verification",
+                )
+            if stored.content_hash != latest.plan_content_hash:
+                return ToolResult.error(
+                    ToolErrorCode.APPROVAL_MISMATCH,
+                    "approval plan content hash does not match the registered plan",
+                )
+            plan = stored.content
+            if (
+                plan.ticket_id != latest.ticket_id
+                or plan.order_id != latest.order_id
+                or plan.action != latest.action
+                or plan.amount != latest.amount
+                or RISK_SEVERITY[plan.risk_level]
+                != RISK_SEVERITY[latest.risk_level]
+            ):
+                return ToolResult.error(
+                    ToolErrorCode.APPROVAL_MISMATCH,
+                    "approval was granted for different plan content",
+                )
         return ToolResult.ok("approval verified", data=latest)
 
     async def _execute(self, refund: Refund) -> ToolResult[Refund]:

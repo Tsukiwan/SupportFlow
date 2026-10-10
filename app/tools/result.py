@@ -42,6 +42,8 @@ class ToolErrorCode(str, Enum):
     TICKET_ORDER_MISMATCH = "TICKET_ORDER_MISMATCH"
     ISSUE_TYPE_MISMATCH = "ISSUE_TYPE_MISMATCH"
     UNRESOLVED_REFUND = "UNRESOLVED_REFUND"
+    # Day 3 hardening: the ticket's cumulative refunds would exceed its claim.
+    CLAIM_EXCEEDED = "CLAIM_EXCEEDED"
 
 
 class ToolResult(BaseModel, Generic[T]):

@@ -8,7 +8,7 @@ fails closed (``allowed=False``).
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.domain.enums import IssueType, OrderStatus, RiskLevel
+from app.domain.enums import IssueType, OrderStatus, RISK_SEVERITY, RiskLevel
 from app.domain.money import Money
 
 
@@ -145,3 +145,25 @@ def evaluate_refund_policy(
         requires_approval=requires_approval,
         approval_risk_level=risk_level,
     )
+
+
+def approval_requirement(
+    ticket_risk_level: RiskLevel, policy: RefundPolicy | None
+) -> tuple[RiskLevel, bool]:
+    """Effective risk and approval requirement, shared by the agent graph
+    and :class:`~app.services.refunds.RefundService` so the service
+    boundary cannot drift from the graph.
+
+    The effective risk is the higher of the ticket's risk level and the
+    policy's required approval level; HIGH-or-above always requires
+    approval, even when the policy table itself does not demand one.
+    """
+    effective_risk = ticket_risk_level
+    requires_approval = False
+    if policy is not None:
+        if RISK_SEVERITY[policy.approval_risk_level] > RISK_SEVERITY[effective_risk]:
+            effective_risk = policy.approval_risk_level
+        requires_approval = policy.requires_approval
+    if RISK_SEVERITY[effective_risk] >= RISK_SEVERITY[RiskLevel.HIGH]:
+        requires_approval = True
+    return effective_risk, requires_approval

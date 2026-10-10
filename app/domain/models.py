@@ -128,6 +128,11 @@ class Approval(BaseModel):
     action: str = Field(min_length=1, max_length=64)
     amount: PositiveMoney | None = None
     risk_level: RiskLevel
+    # SHA-256 of the exact plan content the human reviewed. Optional for
+    # backward compatibility (Day 2 fixtures); when present, RefundService
+    # re-verifies it against the registered plan at execution time, so an
+    # approval can never authorize mutated plan content under the same id.
+    plan_content_hash: str | None = Field(default=None, min_length=1, max_length=128)
     justification: str = Field(min_length=10)
     status: ApprovalStatus = ApprovalStatus.PENDING
     requested_at: AwareDatetime
@@ -200,6 +205,7 @@ class AgentRun(BaseModel):
             AgentRunStatus.COMPLETED,
             AgentRunStatus.FAILED,
             AgentRunStatus.CANCELLED,
+            AgentRunStatus.AWAITING_APPROVAL,
         )
         if terminal and self.finished_at is None:
             raise ValueError("terminal runs require finished_at")
@@ -257,12 +263,24 @@ class ResolutionPlanStep(BaseModel):
 
 
 class ResolutionPlan(BaseModel):
-    """Proposed handling of a ticket. High-risk plans require approval."""
+    """Proposed handling of a ticket. High-risk plans require approval.
+
+    ``order_id`` / ``issue_type`` / ``action`` / ``amount`` are optional
+    because Day 2 constructed plans without them; the Day 3 agent layer
+    always sets them on validated plans, and the plan store hashes the full
+    content so an approval binds the exact plan it was granted for.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     plan_id: str = Field(min_length=1, max_length=64)
     ticket_id: str = Field(min_length=1, max_length=64)
+    order_id: str | None = Field(default=None, min_length=1, max_length=64)
+    issue_type: IssueType | None = None
+    # Operation type ("refund" / "note" / "reply_only"). The agent only
+    # executes actions from a server-validated, stored plan.
+    action: str = Field(default="reply_only", min_length=1, max_length=64)
+    amount: PositiveMoney | None = None
     risk_level: RiskLevel
     requires_approval: bool
     steps: tuple[ResolutionPlanStep, ...] = Field(min_length=1)
@@ -273,4 +291,6 @@ class ResolutionPlan(BaseModel):
         high_risk = RISK_SEVERITY[self.risk_level] >= RISK_SEVERITY[RiskLevel.HIGH]
         if high_risk and not self.requires_approval:
             raise ValueError("plans with HIGH or CRITICAL risk must require approval")
+        if self.action == "refund" and self.amount is None:
+            raise ValueError("refund plans must state an amount")
         return self
