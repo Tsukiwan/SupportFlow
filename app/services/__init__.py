@@ -1,4 +1,16 @@
-"""Application services (order lookup, refund policy, resolution planning).
+"""Application services: refund policy, payments, refunds, audit."""
 
-Empty on Day 1; services will consume the domain models and tool results.
-"""
+from app.services.audit import AuditRecorder
+from app.services.payments import GatewayOutcome, PaymentGateway, SimulatedPaymentGateway
+from app.services.refund_policy import RefundPolicy, evaluate_refund_policy
+from app.services.refunds import RefundService
+
+__all__ = [
+    "AuditRecorder",
+    "GatewayOutcome",
+    "PaymentGateway",
+    "RefundPolicy",
+    "RefundService",
+    "SimulatedPaymentGateway",
+    "evaluate_refund_policy",
+]

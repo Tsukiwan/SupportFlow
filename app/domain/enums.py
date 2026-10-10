@@ -66,6 +66,15 @@ class RefundStatus(str, Enum):
     REJECTED = "rejected"
     PROCESSED = "processed"
     FAILED = "failed"
+    UNKNOWN = "unknown"  # gateway result undeterminable; must be resolved by re-query
+
+
+class ShippingStatus(str, Enum):
+    """Simulated carrier tracking status."""
+
+    CREATED = "created"
+    IN_TRANSIT = "in_transit"
+    DELIVERED = "delivered"
 
 
 class ApprovalStatus(str, Enum):

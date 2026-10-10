@@ -136,10 +136,12 @@ def test_refund_rejects_zero_amount():
     with pytest.raises(ValidationError):
         Refund(
             refund_id="REF-1",
+            idempotency_key="idem-test-0001",
             ticket_id="TKT-1",
             order_id="ORD-1",
             amount=Decimal("0"),
             currency="USD",
+            issue_type=IssueType.REFUND_REQUEST,
             reason="Refund requested by the customer.",
             created_at=T0,
         )
@@ -149,10 +151,12 @@ def test_refund_rejects_processed_before_created():
     with pytest.raises(ValidationError):
         Refund(
             refund_id="REF-1",
+            idempotency_key="idem-test-0001",
             ticket_id="TKT-1",
             order_id="ORD-1",
             amount=Decimal("10.00"),
             currency="USD",
+            issue_type=IssueType.REFUND_REQUEST,
             reason="Refund requested by the customer.",
             created_at=T0,
             processed_at=T0 - timedelta(seconds=1),
@@ -167,6 +171,8 @@ def test_approval_decided_requires_decision_fields():
         Approval(
             approval_id="APR-1",
             ticket_id="TKT-1",
+            order_id="ORD-1",
+            plan_id="PLAN-1",
             action="refund",
             amount=Decimal("10.00"),
             risk_level=RiskLevel.HIGH,
@@ -181,6 +187,8 @@ def test_approval_pending_must_not_carry_decision_fields():
         Approval(
             approval_id="APR-1",
             ticket_id="TKT-1",
+            order_id="ORD-1",
+            plan_id="PLAN-1",
             action="refund",
             amount=Decimal("10.00"),
             risk_level=RiskLevel.HIGH,
@@ -196,6 +204,8 @@ def test_approval_decision_is_consistent():
     approval = Approval(
         approval_id="APR-1",
         ticket_id="TKT-1",
+        order_id="ORD-1",
+        plan_id="PLAN-1",
         action="refund",
         amount=Decimal("10.00"),
         risk_level=RiskLevel.HIGH,

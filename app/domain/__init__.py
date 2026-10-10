@@ -11,6 +11,7 @@ from app.domain.enums import (
     RefundStatus,
     RiskLevel,
     RISK_SEVERITY,
+    ShippingStatus,
     TicketStatus,
 )
 from app.domain.models import (
@@ -21,7 +22,9 @@ from app.domain.models import (
     Refund,
     ResolutionPlan,
     ResolutionPlanStep,
+    Shipment,
     Ticket,
+    TicketNote,
 )
 
 __all__ = [
@@ -39,6 +42,9 @@ __all__ = [
     "ResolutionPlanStep",
     "RiskLevel",
     "RISK_SEVERITY",
+    "Shipment",
+    "ShippingStatus",
     "Ticket",
+    "TicketNote",
     "TicketStatus",
 ]
