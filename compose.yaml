@@ -1,0 +1,32 @@
+# SupportFlow development database (Day 4).
+#
+# Credentials come from the environment (copy .env.example to .env) —
+# nothing secret is hardcoded here. The postgres:16-alpine image is pinned
+# to a major version; the data lives in the named volume "pgdata" and
+# survives `docker compose down` (it is only removed by an explicit
+# `docker compose down -v`).
+#
+#   docker compose up -d          # starts postgres, waits for healthy
+#   uv run alembic upgrade head   # applies migrations
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-supportflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-supportflow}
+    ports:
+      - "127.0.0.1:5432:5432"  # loopback only — never exposed to the LAN
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  pgdata:

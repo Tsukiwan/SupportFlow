@@ -54,9 +54,9 @@ from app.domain.models import Approval, Order, Refund
 from app.persistence.memory_stores import (
     ApprovalStore,
     OrderStore,
-    RefundStore,
     TicketStore,
 )
+from app.persistence.refund_store import RefundStoreProtocol
 from app.services.approvals import latest_approval
 from app.services.audit import AuditRecorder
 from app.services.payments import GatewayOutcome, PaymentGateway
@@ -77,7 +77,7 @@ class RefundService:
         self,
         *,
         orders: OrderStore,
-        refunds: RefundStore,
+        refunds: RefundStoreProtocol,
         tickets: TicketStore,
         approvals: ApprovalStore,
         gateway: PaymentGateway,
@@ -237,6 +237,21 @@ class RefundService:
                     return ToolResult.error(
                         ToolErrorCode.CLAIM_EXCEEDED,
                         "cumulative refunds for this ticket would exceed its claimed amount",
+                    )
+                if reopen_kind == "concurrent":
+                    return ToolResult.error(
+                        ToolErrorCode.CONCURRENT_PROCESSING,
+                        "order is being processed by another request",
+                        retryable=True,
+                    )
+                if reopen_kind == "unresolved":
+                    return ToolResult.error(
+                        ToolErrorCode.UNRESOLVED_REFUND,
+                        f"order has an unresolved refund ({reopened.refund_id}); "
+                        "resolve it with the original idempotency_key before "
+                        "retrying this refund",
+                        retryable=False,
+                        data=reopened,
                     )
                 if reopened is None:
                     return ToolResult.error(

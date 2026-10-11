@@ -324,20 +324,47 @@ class RefundStore:
         *,
         orders: OrderStore,
         ticket_claimed_amount: Decimal | None,
-    ) -> tuple[Literal["reopened", "balance_exceeded", "claim_exceeded"], Refund | None]:
+    ) -> tuple[
+        Literal[
+            "reopened", "balance_exceeded", "claim_exceeded", "concurrent",
+            "unresolved",
+        ],
+        Refund | None,
+    ]:
         """Retry a transiently failed refund: atomically re-check the
-        ticket claim cap, re-reserve the balance and move the record back
-        to PENDING. The claim check counts only the ticket's
-        PROCESSED/PENDING/UNKNOWN records — the FAILED record being
-        reopened holds no reservation and is deliberately excluded, so a
-        retry of the original operation must fit on top of everything else
-        that currently occupies the claim. Nothing is reserved and no
-        state changes unless every check passes, so a refused reopen never
-        leaves a reservation behind and never reaches the gateway."""
+        same-order unresolved gate, the ticket claim cap and the balance
+        reservation, then move the record back to PENDING.
+
+        The same-order gate is re-applied here: a FAILED refund must not
+        reopen while another refund of the same order is PENDING (a
+        different request is executing right now) or UNKNOWN (the original
+        operation must be resolved first) — the gate exists to keep at
+        most one unresolved refund per order, and the same-key FAILED
+        branch of ``create`` skips the shared scan, so this method is the
+        one place the retry path re-checks it. The FAILED record being
+        reopened is itself excluded from the scan.
+
+        The claim check counts only the ticket's PROCESSED/PENDING/UNKNOWN
+        records — the FAILED record being reopened holds no reservation
+        and is deliberately excluded, so a retry of the original operation
+        must fit on top of everything else that currently occupies the
+        claim. Nothing is reserved and no state changes unless every
+        check passes, so a refused reopen never leaves a reservation
+        behind and never reaches the gateway."""
         with self._lock:
             refund = self._by_id.get(refund_id)
             if refund is None or refund.status is not RefundStatus.FAILED:
                 return "balance_exceeded", None
+            # Same-order unresolved gate (same rule as create's scan for
+            # different keys): another refund of this order that is still
+            # in flight or unresolved blocks the reopen.
+            for other in self._by_id.values():
+                if other.refund_id == refund.refund_id or other.order_id != refund.order_id:
+                    continue
+                if other.status is RefundStatus.PENDING:
+                    return "concurrent", None
+                if other.status is RefundStatus.UNKNOWN:
+                    return "unresolved", other
             claimed = (
                 ticket_claimed_amount
                 if ticket_claimed_amount is not None

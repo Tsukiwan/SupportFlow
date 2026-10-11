@@ -21,6 +21,7 @@ from app.persistence.memory_stores import (
     TicketNoteStore,
     TicketStore,
 )
+from app.persistence.refund_store import RefundStoreProtocol
 from app.services.audit import AuditRecorder
 from app.services.payments import PaymentGateway, SimulatedPaymentGateway
 from app.services.plans import PlanStore
@@ -46,7 +47,7 @@ class ToolSet:
         self,
         *,
         orders: OrderStore,
-        refunds: RefundStore,
+        refunds: RefundStoreProtocol,
         shipments: ShippingStore,
         tickets: TicketStore,
         notes: TicketNoteStore,
