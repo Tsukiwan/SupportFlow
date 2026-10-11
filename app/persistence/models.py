@@ -167,6 +167,26 @@ class RefundRow(Base):
     reason: Mapped[str] = mapped_column(sa.Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False)
     processed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP, nullable=True)
+    # --- Day 6: recovery lease and attempt tracking -------------------
+    #
+    # The recovery service claims a refund with an atomic conditional
+    # UPDATE before querying the gateway (the query happens outside any
+    # database transaction). The claim is a lease, never ownership of the
+    # refund's money: expiry only permits another status query, it never
+    # permits re-execution. Terminal rows carry no claim; the ordinary
+    # finalize path clears these fields when it settles a row.
+    recovery_claim_owner: Mapped[str | None] = mapped_column(
+        sa.String(64), nullable=True
+    )
+    recovery_claim_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP, nullable=True
+    )
+    recovery_attempts: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, server_default=sa.text("0")
+    )
+    last_recovery_error: Mapped[str | None] = mapped_column(
+        sa.String(512), nullable=True
+    )
 
 
 class ApprovalRow(Base):

@@ -42,12 +42,12 @@ store and is ignored: order state lives in the ``orders`` table and is
 locked/updated inside the transaction.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Literal
 from uuid import uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -337,7 +337,8 @@ class PgRefundStore:
         terminal status and changes nothing. The balance moves in the
         same transaction: the reservation is released on FAILED/REJECTED,
         moved into the confirmed refunded amount on PROCESSED, and kept
-        for UNKNOWN (fail closed)."""
+        for UNKNOWN (fail closed). Reaching a terminal status also clears
+        any recovery claim — a settled row has nothing left to recover."""
         with session_scope(self._sessions) as s:
             row = self._by_id(s, refund_id)
             if row is None:
@@ -362,32 +363,11 @@ class PgRefundStore:
                 # The in-memory store is laxer here; the database store
                 # refuses invalid transition targets outright.
                 return None
-            amount = row.amount
-            if status in (RefundStatus.FAILED, RefundStatus.REJECTED):
-                s.execute(
-                    update(OrderRow)
-                    .where(OrderRow.order_id == row.order_id)
-                    .values(
-                        reserved_amount=func.greatest(
-                            Decimal("0"), OrderRow.reserved_amount - amount
-                        )
-                    )
-                )
-            elif status is RefundStatus.PROCESSED:
-                s.execute(
-                    update(OrderRow)
-                    .where(OrderRow.order_id == row.order_id)
-                    .values(
-                        reserved_amount=func.greatest(
-                            Decimal("0"), OrderRow.reserved_amount - amount
-                        ),
-                        refunded_amount=OrderRow.refunded_amount + amount,
-                    )
-                )
-            # UNKNOWN: the reservation stays (fail closed).
+            self._move_balances(s, row, status)
             row.status = status.value
             if status is RefundStatus.PROCESSED:
                 row.processed_at = now
+            self._clear_recovery_claim(row)
             s.add(
                 self._audit_row(
                     "refund_store.finalize",
@@ -404,6 +384,242 @@ class PgRefundStore:
             )
             s.flush()
             return self._to_domain(row)
+
+    @staticmethod
+    def _move_balances(s: Session, row: RefundRow, status: RefundStatus) -> None:
+        """Balance movement for a terminal transition, on an already
+        locked order row. FAILED/REJECTED release the reservation;
+        PROCESSED moves it into the confirmed refunded amount; UNKNOWN
+        moves nothing (fail closed, the reservation stays held)."""
+        amount = row.amount
+        if status in (RefundStatus.FAILED, RefundStatus.REJECTED):
+            s.execute(
+                update(OrderRow)
+                .where(OrderRow.order_id == row.order_id)
+                .values(
+                    reserved_amount=func.greatest(
+                        Decimal("0"), OrderRow.reserved_amount - amount
+                    )
+                )
+            )
+        elif status is RefundStatus.PROCESSED:
+            s.execute(
+                update(OrderRow)
+                .where(OrderRow.order_id == row.order_id)
+                .values(
+                    reserved_amount=func.greatest(
+                        Decimal("0"), OrderRow.reserved_amount - amount
+                    ),
+                    refunded_amount=OrderRow.refunded_amount + amount,
+                )
+            )
+
+    @staticmethod
+    def _clear_recovery_claim(row: RefundRow) -> None:
+        row.recovery_claim_owner = None
+        row.recovery_claim_expires_at = None
+
+    # ------------------------------------------------------------------
+    # recovery (Day 6): discovery, lease claim, lease-guarded settle
+    # ------------------------------------------------------------------
+
+    def find_recoverable(
+        self, now: datetime, *, pending_grace_seconds: float
+    ) -> tuple[Refund, ...]:
+        """Refunds eligible for a recovery attempt, oldest first.
+
+        - UNKNOWN rows are always eligible: no live executor owns an
+          UNKNOWN row, and a repeated query is exactly what resolution
+          needs.
+        - PENDING rows only become eligible once they are older than
+          ``pending_grace_seconds`` — a PENDING row younger than that may
+          still belong to a live executor whose gateway call is in
+          flight, and querying it early is wasted work (it is never
+          unsafe: recovery only queries, and settling is idempotent).
+        - A row whose recovery lease is still valid is not eligible; its
+          claim expiry is the retry schedule.
+        """
+        grace_cutoff = now - timedelta(seconds=pending_grace_seconds)
+        with session_scope(self._sessions) as s:
+            rows = (
+                s.execute(
+                    select(RefundRow)
+                    .where(
+                        RefundRow.status.in_(UNRESOLVED),
+                        or_(
+                            RefundRow.recovery_claim_expires_at.is_(None),
+                            RefundRow.recovery_claim_expires_at < now,
+                        ),
+                        or_(
+                            RefundRow.status == RefundStatus.UNKNOWN.value,
+                            RefundRow.created_at <= grace_cutoff,
+                        ),
+                    )
+                    .order_by(RefundRow.created_at)
+                )
+                .scalars()
+                .all()
+            )
+            return tuple(self._to_domain(row) for row in rows)
+
+    def claim_recovery(
+        self,
+        refund_id: str,
+        *,
+        owner: str,
+        expires_at: datetime,
+        now: datetime,
+    ) -> Literal["claimed", "terminal", "active_claim", "not_found"]:
+        """Atomically take the recovery lease on one refund.
+
+        One conditional UPDATE is the whole claim: only an unresolved
+        row with no unexpired claim matches, so two concurrent claimers
+        serialize on the row lock and exactly one gets ``rowcount == 1``.
+        No lock is held after this transaction — the gateway query runs
+        outside it. Expiry only permits another query, never another
+        execution (recovery has no execute path at all)."""
+        with session_scope(self._sessions) as s:
+            claimed = s.execute(
+                update(RefundRow)
+                .where(
+                    RefundRow.refund_id == refund_id,
+                    RefundRow.status.in_(UNRESOLVED),
+                    or_(
+                        RefundRow.recovery_claim_expires_at.is_(None),
+                        RefundRow.recovery_claim_expires_at < now,
+                    ),
+                )
+                .values(
+                    recovery_claim_owner=owner,
+                    recovery_claim_expires_at=expires_at,
+                    recovery_attempts=RefundRow.recovery_attempts + 1,
+                )
+            )
+            if claimed.rowcount == 1:
+                return "claimed"
+            row = self._by_id(s, refund_id)
+            if row is None:
+                return "not_found"
+            if row.status not in UNRESOLVED:
+                return "terminal"
+            return "active_claim"
+
+    def settle_recovered(
+        self,
+        refund_id: str,
+        *,
+        expected_owner: str,
+        status: RefundStatus,
+        now: datetime,
+        gateway_result: str,
+    ) -> Literal["settled", "already_terminal", "lost_ownership", "not_found"]:
+        """Lease-guarded settle from gateway evidence, in one transaction.
+
+        The row is locked and re-read: if another worker settled it
+        meanwhile, or the lease moved on (a newer worker now owns the
+        claim), nothing is written — a late worker can never overwrite a
+        newer terminal state. The balance movement is the same as
+        ``finalize`` (PROCESSED moves the reservation into the confirmed
+        refunded amount; FAILED releases it), the audit event carries the
+        gateway evidence, and the lease is cleared."""
+        if status not in (RefundStatus.PROCESSED, RefundStatus.FAILED):
+            raise ValueError(
+                f"recovery may only settle to PROCESSED or FAILED, got {status}"
+            )
+        with session_scope(self._sessions) as s:
+            peek = self._by_id(s, refund_id)
+            if peek is None:
+                return "not_found"
+            order = s.execute(
+                select(OrderRow)
+                .where(OrderRow.order_id == peek.order_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if order is None:
+                return "not_found"  # FK-violating state; refuse
+            row = s.execute(
+                select(RefundRow)
+                .where(RefundRow.refund_id == refund_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).scalar_one_or_none()
+            if row is None:
+                return "not_found"
+            if row.status not in UNRESOLVED:
+                return "already_terminal"
+            if row.recovery_claim_owner != expected_owner:
+                # The lease moved on (expired and re-claimed) while our
+                # gateway query ran. Our evidence is stale; abstain.
+                return "lost_ownership"
+            self._move_balances(s, row, status)
+            row.status = status.value
+            if status is RefundStatus.PROCESSED:
+                row.processed_at = now
+            self._clear_recovery_claim(row)
+            row.last_recovery_error = None
+            s.add(
+                self._audit_row(
+                    "refund_store.recovery_settle",
+                    ticket_id=row.ticket_id,
+                    order_id=row.order_id,
+                    run_id=row.run_id,
+                    now=now,
+                    details={
+                        "refund_id": row.refund_id,
+                        "amount": str(row.amount),
+                        "status": row.status,
+                        "gateway_result": gateway_result,
+                    },
+                )
+            )
+            s.flush()
+            return "settled"
+
+    def mark_recovery_kept_unknown(
+        self,
+        refund_id: str,
+        *,
+        expected_owner: str,
+        reason: str,
+        now: datetime,
+    ) -> Literal["recorded", "already_terminal", "lost_ownership", "not_found"]:
+        """Record a recovery attempt that could not settle the refund.
+
+        The reservation stays held, the status stays UNKNOWN/PENDING, the
+        claim stays until its expiry (which is the retry schedule), and
+        the reason lands on ``last_recovery_error`` for operators. A
+        lease that has moved on (or a row that was settled) is never
+        touched by this late worker."""
+        with session_scope(self._sessions) as s:
+            row = s.execute(
+                select(RefundRow)
+                .where(RefundRow.refund_id == refund_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).scalar_one_or_none()
+            if row is None:
+                return "not_found"
+            if row.status not in UNRESOLVED:
+                return "already_terminal"
+            if row.recovery_claim_owner != expected_owner:
+                return "lost_ownership"
+            row.last_recovery_error = reason[:512]
+            s.add(
+                self._audit_row(
+                    "refund_store.recovery_kept_unknown",
+                    ticket_id=row.ticket_id,
+                    order_id=row.order_id,
+                    run_id=row.run_id,
+                    now=now,
+                    details={
+                        "refund_id": row.refund_id,
+                        "status": row.status,
+                        "reason": reason[:512],
+                    },
+                )
+            )
+            s.flush()
+            return "recorded"
 
     # ------------------------------------------------------------------
     # reopen
