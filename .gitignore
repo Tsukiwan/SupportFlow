@@ -21,3 +21,4 @@ htmlcov/
 # Local data
 supportflow.db
 *.sqlite3
+demo_gateway_ledger.json   # crash-recovery demo artifact

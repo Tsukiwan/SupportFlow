@@ -1,219 +1,386 @@
 # SupportFlow
 
-AI 客服工单处理 Agent:查询订单、检查退款政策、提出处理方案,高风险操作前等待人工审批。所有退款均为模拟操作。
+一个使用 LangGraph 编排客服退款流程的 Python Agent,结合 PostgreSQL 持久化、退款幂等控制、人工审批门禁和 UNKNOWN 结果恢复,演示「外部网关调用与本地数据库事务不构成原子事务」时如何安全处理故障。
 
-## 项目边界(重要)
+> **项目状态**:教学/作品集项目。退款为模拟操作([FakeGateway](app/services/payments.py) 确定性替身),不连接真实支付网关;真实网关契约、幂等窗口与最终一致性尚未验证。本系统不是经过生产验证的支付系统,也不宣称绝对安全。
 
-- ✅ 构建:工单领域模型、订单查询、退款政策检查、处理方案生成、人工审批门禁、审计日志、LangGraph Agent 主流程
-- ❌ 不构建:RAG、向量数据库、知识库问答系统
-- ⚠️ 退款为模拟操作,不连接真实支付网关
-- 模型供应商:DeepSeek(OpenAI 兼容 API),Key 与模型名通过环境变量配置;未配置 Key 时使用确定性离线实现
+解决的问题:
 
-## Day 1 状态
+- **LLM 不可信输入**:工单文本与模型提议一律视为不可信,订单归属、金额、政策、审批、执行权限全部由服务端确定性规则重验;
+- **重复与并发**:同一请求重放、并发双跑、Agent 重试都不能产生第二笔退款或重复记账;
+- **人工审批门禁**:高风险退款(如「物流已签收、客户称未收到」)必须经人工批准,审批绑定计划内容哈希,修改计划或伪造审批均无法放行;
+- **结果不确定时的安全收敛**:网关超时/崩溃/查询失败绝不臆断——预留保留(fail-closed),由恢复服务只查询原操作,仅凭确凿证据结算或释放;
+- **跨重启可审计**:PostgreSQL 后端下,退款、账务、审计、恢复租约全部落库,审计与业务变更同事务提交。
 
-已就位:领域模型与枚举、金额规则(Decimal,拒绝 float)、统一 ToolResult、配置(环境变量 + SecretStr)、结构化 JSON 日志(密钥脱敏)、确定性模拟数据(6 个场景)。
+## 设计亮点
 
-## Day 2 状态
+每条亮点按「问题 → 设计 → 代码位置 → 验证方式」说明。
 
-已就位:业务工具层与退款安全边界。5 个工具(`get_order` / `get_shipping_status` / `get_refund_policy` / `create_refund` / `add_ticket_note`)全部返回统一 ToolResult;退款工具在服务端独立完成全部安全校验(工单-订单绑定、订单存在性与状态、金额精度、实时可退余额、结构化政策、审批绑定订单/金额/计划版本/风险等级/有效期、全意图幂等键、并发互斥、单笔未决退款门禁),不信任 LLM 或调用方提供的任何状态声明——issue_type 与政策一律以工单记录为准,谎报直接拒绝;所有退款走模拟支付网关,支持业务拒绝/确认未执行的暂时性失败/结果未知三类非成功结果,网关异常与任务取消一律按未知结果处理(保留余额预留),未知结果必须先查询原操作再处理,绝不盲目二次执行;同一订单存在 PENDING/UNKNOWN 退款时,异键新退款被拒绝,直到原操作被确认处理、确认拒绝或确认未执行并安全释放;订单余额区分「已确认退款」与「预留」;每次工具调用写入审计事件(工具名、结果类别、耗时、run_id、关联 ID,无密钥无 PII),取消的调用单独记为 cancelled。
+### 1. 为什么退款需要预留额度(reservation)
 
-## Day 3 状态
+- **问题**:退款从校验到网关确认之间有时间窗,期间并发请求或重试可能重复占用同一笔可退余额;若只记「已退款」不记「在途」,余额会在确认前被再次花掉。
+- **设计**:创建退款时在**同一数据库事务**内原子预留——一条条件 UPDATE(`refunded + reserved + amount <= total`),而不是先读后写;网关确认后把预留转入已退款,失败/拒绝则释放,结果未知则保留(fail-closed)。库级 CHECK 约束兜底:任何路径都无法让 `refunded + reserved > total`。
+- **代码**:[pg_refund_store.py](app/persistence/pg_refund_store.py) `_create_new` 条件 UPDATE + `_move_balances`;[models.py](app/persistence/models.py) `ck_orders_balance_invariant`。
+- **验证**:`test_insufficient_balance_commits_nothing`(超额拒绝零账务变化)、`test_two_processes_two_orders_balance_invariants`(真实 PG 双进程并发,余额不变量保持)。
 
-已就位:LangGraph Agent 主流程([app/agent/graph.py](app/agent/graph.py)),固定图结构、模型不选工具:
+### 2. 如何避免重复退款与重复记账
 
-**图结构与路由** — `init_run → classify → gather_context → select_plan → validate_plan`,然后条件路由:`continue`(执行)/ `await_approval`(请求审批)/ `business_rejection`(拒绝,直接回复)/ `fatal`(终止,运行记 FAILED);执行侧 `execute → verify_result`,仅对确认未执行的暂时性失败按 `retry` 受限重试(硬迭代上限,`recursion_limit` 兜底),`unknown` 进入待核实(`needs_verification`,绝不盲目重试),最后 `reply → finalize`。工单只在业务完成条件经核验后进入 RESOLVED;等待审批与失败运行永不解决工单。
+- **问题**:网络重试、Agent 重跑、并发双跑都可能让同一个退款请求被执行两次——扣两次钱或记两次账。
+- **设计**:全意图幂等键(工单+订单+金额+计划版本等绑定为一个键,数据库唯一约束);同键重放解析到原记录,异意图冲突明确拒绝;结算路径在行锁下重查状态,终态不可二次结算。
+- **代码**:[pg_refund_store.py](app/persistence/pg_refund_store.py) `create` 同键分支、`finalize` 锁后状态复查;[models.py](app/persistence/models.py) `uq_refunds_idempotency_key`。
+- **验证**:`test_same_key_same_intent_never_creates_a_second_row`、`test_finalize_never_settles_twice`、`test_two_processes_finalize_no_double_settle`(spawn 双进程,恰一次结算)。
 
-**可信计划与审批绑定(核心安全)** — LLM 只产出计划「提议」;服务端生成 `plan_id` 并注册进 [PlanStore](app/services/plans.py)(内容 SHA-256,同 id 异内容注册报错,读取时重算哈希防篡改);[Approval](app/domain/models.py) 记录 `plan_content_hash` 并绑定工单/订单/金额/风险等级/动作;执行前从 PlanStore `load_verified` 重新加载计划并复核哈希与字段——不接受 LLM 单方面声明的计划内容,修改计划金额或重用 plan_id 都无法让旧审批继续授权;**哈希缺失的审批一律按 mismatch fail-closed**(仅 Day 2 测试夹具的无 PlanStore 构造保留兼容路径,生产入口 `build_default_tool_set` 强制注入 PlanStore);同一校验在 graph 门禁与 RefundService 双重执行,审批风险等级必须达到「有效风险」(工单风险与政策要求取高,HIGH 及以上一律要求审批)——该规则由 [approval_requirement](app/services/refund_policy.py) 单一函数供两层共享,绕过 graph 直接调用服务同样被拦截。
+### 3. 如何区分网关执行结果与本地数据库状态
 
-**人工审批暂停与恢复** — 高风险计划暂停:`ticket → PENDING_APPROVAL`,`run → AWAITING_APPROVAL`,绝不 resolved;决策只经 [ApprovalService.decide](app/services/approvals.py)(人工侧入口,记录 actor、decided_at、有效期、计划哈希),Agent 图没有 approve/decide 工具;恢复时重新运行工单,图复用审批绑定的存储计划(不再咨询 LLM 新提议),并重验审批状态、有效期与计划哈希;拒绝/过期/不匹配均不执行退款。
+- **问题**:网关异常(超时、连接中断)说明不了退款是否已执行——连接可能在钱已划走后断开。凭异常类型推断结果会误放预留或误报成功。
+- **设计**:网关结果与本地状态显式分离:`GatewayOutcome`(网关侧:已执行/拒绝/确认未执行/未知)vs `RefundStatus`(本地账务:PENDING/UNKNOWN/终态)。异常一律按 UNKNOWN 处理,预留保留;只有显式的「确认未执行」才走失败释放路径。
+- **代码**:[refunds.py](app/services/refunds.py) `_execute` 异常分支、`_apply_gateway_outcome` 结果分类。
+- **验证**:`test_unknown_outcome_keeps_reservation_and_resolves_by_query`、`test_query_error_never_becomes_failed`(查询失败不误判)。
 
-**执行安全与结果核验** — 图只调用审计过的 ToolSet,禁止直接改余额/退款状态/网关状态(有静态测试守卫);PROCESSED 经持久化记录核验后才算成功;UNKNOWN 进入待核实且同订单异键新退款被门禁拒绝;REJECTED 不标成功、预留释放;退款成功后回复生成失败只换模板、绝不重发退款;**工单级索赔封顶**:同一工单的全部退款(已结算/在途/未决)累计不得超过其索赔额,检查与余额预留在同一原子临界区内完成——并发双跑、新 plan_id、新幂等键、或退款已成功而工单尚未 RESOLVED 的重跑,都无法产生第二笔超索赔退款;同一工单在索赔额内的多次部分退款仍然合法;客服回复只用可信数据与核验结果,与结果冲突的模型文本被机械校验替换(required/forbidden token)。
+### 4. 为什么 UNKNOWN 不能直接视为失败
 
-**审计与 run_id** — 全部事件贯穿 `ticket_id` 与 `run_id`,区分:运行开始、分类(提议与可信记录分歧)、上下文查询、计划提议(含回退重试数)、计划校验(通过/业务拒绝)、审批门禁与请求、审批决策(`actor=human`)、工具调用(含 `create_refund.approval_verified`)、执行、结果核验、回复(成功/模板回退)、运行终止;「生成退款计划」与「退款已执行」是不同事件。
+- **问题**:把 UNKNOWN 当成 FAILED 会释放预留,而网关可能已经把钱退给客户——结果是被退款且余额被他人再用,或重复退款。
+- **设计**:UNKNOWN 保留状态与预留(fail-closed),同键重试时**查询原操作**(只读)再决定;恢复服务同样只凭确凿证据结算。终态行永不移动。
+- **代码**:[recovery.py](app/services/recovery.py) `plan_recovery_action`;[refunds.py](app/services/refunds.py) `_resolve_unknown`。
+- **验证**:`test_unknown_evidence_keeps_status_and_reservation`(预留保持 50.00)、`test_terminal_rows_are_never_moved_regardless_of_evidence`。
 
-**LLM 协作与提示注入** — 分类/计划/回复均为有界重试(2 次)后回退确定性默认实现的提议;工单文本与用户消息视为不可信输入,订单归属/金额/政策/审批/执行权限全部由服务端重验;LLM 无法通过自然语言改变服务端规则,也无法接触工具。
+### 5. 如何用稳定操作标识查询原操作
 
-**离线确定性演示** — [app/agent/demo.py](app/agent/demo.py) 覆盖 4 个场景(低风险自动退款、高风险暂停→人工批准→恢复执行、索赔超额拒绝、订单不存在拒绝),强制离线协作者,输出可复现:
+- **问题**:恢复/重试必须问网关「那笔操作到底怎样了」,但拿什么问?若查询键不稳定(或每次重试生成新键),查询就落空。
+- **设计**:`refund_id` 在**任何网关调用之前**随 PENDING 行落库(create 事务先于 execute),它就是网关查询键;恢复服务与同键重试都用它查询**原始操作**,绝不新建操作。
+- **代码**:[pg_refund_store.py](app/persistence/pg_refund_store.py) `create`;[recovery.py](app/services/recovery.py) `_recover_one`。
+- **验证**:`test_crash_window_pending_row_is_recovered`(崩溃窗口行被恢复,且 `gateway.execute_calls == 0`)。
+
+### 6. 恢复 worker 如何用租约、owner token 和事务保护结算
+
+- **问题**:多个恢复 worker 并发扫描同一批 UNKNOWN 退款时,可能重复查询、重复结算;崩溃的 worker 留下的状态还可能被迟到结果覆盖。
+- **设计**:三段式——①原子条件 UPDATE 取得**租约**(owner token + 过期时间,`rowcount==1` 者得);②网关查询在**事务外**执行(不持锁等网络);③结算在新事务中 `FOR UPDATE` 重读行 + owner token 校验,租约过期或被接管则拒绝写入。租约过期只意味着允许再次查询,绝不意味着可以再次执行。
+- **代码**:[pg_refund_store.py](app/persistence/pg_refund_store.py) `claim_recovery` / `settle_recovered`;[recovery.py](app/services/recovery.py) `_recover_one`。
+- **验证**:`test_two_concurrent_workers_settle_exactly_once`、`test_stale_worker_cannot_overwrite_newer_state`、`test_crashed_worker_claim_recovers_after_lease_expiry`。
+
+### 7. 如何通过审计记录追踪状态变化
+
+- **问题**:出了问题时需要回答「谁在什么时候把哪笔钱怎么样了」——没有审计,只有终态。
+- **设计**:每次状态变化(创建/结算/释放/恢复/审批)与业务变更**同事务**写入审计事件(actor/action/关联 ID/明细);审计写失败则整体回滚——审计里永远不会出现数据库里不存在的状态。
+- **代码**:[pg_refund_store.py](app/persistence/pg_refund_store.py) 各路径 `_audit_row`;[models.py](app/persistence/models.py) `audit_events` 表。
+- **验证**:`test_recovery_settle_writes_audit_and_failure_rolls_back_atomically`(故障注入:审计抛错 → 状态/余额/审计整体回滚,孤儿审计=0)。
+
+## 架构
+
+技术栈:Python 3.12+ · uv · LangGraph · SQLAlchemy 2.x(Alembic 迁移)· Pydantic v2 · FastAPI · PostgreSQL 16 · pytest。运行时后端可切换:内存 Store(默认,单进程演示)与 PostgreSQL(退款链路全落库)。
+
+```mermaid
+flowchart TB
+    subgraph entry["入口"]
+        TICKET["客服工单"]
+        API["FastAPI(仅 /health,只读配置)"]
+    end
+    subgraph agent["LangGraph Agent(app/agent/)"]
+        GRAPH["graph.py 固定图结构<br/>classify → context → plan → validate<br/>→ execute → verify → reply<br/>模型不选工具"]
+        LLM["llm.py 分类/计划/回复<br/>离线确定性默认 · DeepSeek 可选"]
+        RUNNER["runner.py wiring + run_ticket<br/>迭代硬上限 + recursion_limit"]
+    end
+    subgraph services["服务层(app/services/)"]
+        REFUNDS["refunds.py 退款安全边界<br/>校验 · 审批门禁 · 幂等 · 结果核验"]
+        APPROVALS["approvals.py 人工审批<br/>绑定计划哈希/金额/有效期"]
+        RECOVERY["recovery.py UNKNOWN 恢复<br/>只查询原操作,无执行路径"]
+        PLANS["plans.py 计划注册<br/>内容 SHA-256,读取重算"]
+        GATEWAY["payments.py 模拟支付网关<br/>FakeGateway:确定性替身"]
+    end
+    subgraph persist["持久层(app/persistence/)"]
+        MEM["memory_stores.py 内存 Store<br/>默认,单进程,锁保护"]
+        PG[("PostgreSQL 16<br/>8 表:FK / CHECK / 部分唯一索引<br/>行锁 + 条件更新")]
+    end
+    TICKET --> GRAPH
+    GRAPH --> LLM
+    GRAPH --> REFUNDS
+    REFUNDS --> APPROVALS
+    REFUNDS --> PLANS
+    REFUNDS --> GATEWAY
+    RECOVERY -.->|"仅只读查询,无执行"| GATEWAY
+    RECOVERY --> PG
+    REFUNDS --> MEM
+    REFUNDS --> PG
+```
+
+### 正常退款流程
+
+```mermaid
+sequenceDiagram
+    participant U as 工单
+    participant G as Agent 图
+    participant R as RefundService
+    participant D as Store(内存/PG)
+    participant GW as 支付网关(模拟)
+    G->>G: classify 分类(工单记录为准)
+    G->>G: gather_context(订单/物流/政策)
+    G->>G: select_plan(提议计划,服务端注册 + 哈希)
+    G->>G: validate_plan(政策校验,审批要求判定)
+    alt 低风险
+        G->>R: create_refund
+    else 高风险(需审批)
+        G->>U: 暂停:PENDING_APPROVAL / AWAITING_APPROVAL
+        U->>G: 人工决定后重跑工单
+        G->>G: 重验审批状态/有效期/计划哈希
+        G->>R: create_refund(approval_verified)
+    end
+    R->>D: 同事务:幂等键 + 同订单门禁 + claim 封顶 + 条件预留 + 审计
+    D-->>R: PENDING(余额预留)
+    R->>GW: execute(模拟退款)
+    alt PROCESSED
+        GW-->>R: 已执行
+        R->>D: finalize → PROCESSED(预留转已退款)
+    else REJECTED / 暂时失败
+        GW-->>R: 确认未执行
+        R->>D: finalize → REJECTED / FAILED(释放预留)
+    else UNKNOWN
+        GW-->>R: 结果未知
+        R->>D: finalize → UNKNOWN(预留保留,fail-closed)
+    end
+    G->>G: verify 经持久化记录核验 + reply
+```
+
+### 退款状态机与 UNKNOWN 恢复
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: create(预留余额)
+    PENDING --> PROCESSED: 网关已执行
+    PENDING --> FAILED: 确认未执行
+    PENDING --> REJECTED: 网关拒绝
+    PENDING --> UNKNOWN: 结果未知(预留保留)
+    UNKNOWN --> PROCESSED: 恢复查询 SUCCEEDED
+    UNKNOWN --> FAILED: 恢复查询 FAILED(释放预留)
+    UNKNOWN --> UNKNOWN: 查询仍无确凿证据(租约到期后重查)
+    FAILED --> PENDING: 同键重试 reopen(重新过全部门禁)
+    PROCESSED --> [*]
+    REJECTED --> [*]
+```
+
+恢复闭环([recovery.py](app/services/recovery.py),结构上**没有执行路径**——恢复侧只调用只读的 `query_status`,从构造上杜绝二次扣款):
+
+```mermaid
+flowchart LR
+    A["发现:UNKNOWN 始终合格<br/>PENDING 超出宽限期(覆盖崩溃窗口)"] --> B["原子条件 UPDATE 取得租约<br/>(owner + 过期时间)"]
+    B --> C{"网关查询原操作<br/>事务外,只读"}
+    C -->|"SUCCEEDED(确凿证据)"| D["租约守卫结算 PROCESSED<br/>预留转已退款"]
+    C -->|"FAILED(确凿证据)"| E["租约守卫结算 FAILED<br/>释放预留"]
+    C -->|"UNKNOWN / 查询失败"| F["保持 UNKNOWN<br/>预留保留,记录原因"]
+    F -->|"租约过期 = 仅允许再次查询"| B
+    D --> G[终态]
+    E --> G
+```
+
+### 关键安全不变量
+
+| # | 不变量 | 实现位置 |
+| --- | --- | --- |
+| 1 | 幂等:同请求重放/跨进程重试解析到同一退款,绝不建第二行 | 全意图幂等键 + DB 唯一约束 `uq_refunds_idempotency_key`([models.py](app/persistence/models.py)) |
+| 2 | 同订单至多一笔 PENDING\|UNKNOWN 退款 | 部分唯一索引 `uq_refunds_order_unresolved` + 应用层同订单门禁 |
+| 3 | 余额:预留是条件 UPDATE(非读后写),库级 CHECK 兜底 | [pg_refund_store.py](app/persistence/pg_refund_store.py) 条件 UPDATE;`ck_orders_balance_invariant` |
+| 4 | 工单索赔封顶读自**锁定**的工单行,不信任调用方参数 | `FOR UPDATE` + 聚合计算([pg_refund_store.py](app/persistence/pg_refund_store.py)) |
+| 5 | 审计与业务变更同事务:审计写失败则退款整体回滚 | 所有 store 路径同一事务写审计;集成测试含原子性故障注入 |
+| 6 | 行锁顺序固定 orders → tickets → refunds,无反向加锁路径 | 各 store 方法 |
+| 7 | 唯一冲突按约束名精确映射,其余 DB 错误原样抛出,不伪装成业务拒绝 | `_constraint_name` 白名单 |
+| 8 | 审批绑定计划内容哈希;执行前重新加载并复核哈希/金额/有效期 | [plans.py](app/services/plans.py) + [approvals.py](app/services/approvals.py) |
+| 9 | 终态(PROCESSED/REJECTED)永不移动;UNKNOWN 绝不自动当成 FAILED | `plan_recovery_action` + 结算前状态复查 |
+| 10 | 恢复只查询、无执行;租约过期只允许再次查询,绝不代表可再次执行 | [recovery.py](app/services/recovery.py) 无 execute 路径(测试断言 `execute_calls == 0`) |
+| 11 | 数据库事务绝不跨网关调用 | claim(事务)→ 查询(事务外)→ 结算(新事务,行锁 + owner 校验) |
+| 12 | Agent 循环硬上限 + LangGraph recursion_limit;运行记录库级 CHECK `iterations <= max_iterations` | [runner.py](app/agent/runner.py) + [models.py](app/persistence/models.py) |
+| 13 | 后端显式选择:PG 初始化失败即抛错,绝不静默回退内存 | [runner.py](app/agent/runner.py) `build_agent_wiring` |
+
+## 快速开始
+
+```bash
+uv sync                # 前置:Python >= 3.12 与 uv;锁文件 uv.lock 保证依赖可复现
+cp .env.example .env   # .env.example 只含占位符,不配置 API Key 也能完整离线运行
+```
+
+**内存模式端到端演示**。前置:仅上面两步,无需数据库、网络或 LLM Key;确定性输出:
 
 ```bash
 uv run python -m app.agent.demo
 ```
 
-PG 后端演示(需本地 PG 已启动,幂等 seed;第二遍运行演示持久化——已退款订单被余额门禁拒绝,账务不变):
+**HTTP API**(当前仅健康检查)。前置:同上,无需数据库(`/health` 只读配置,不连库):
 
 ```bash
+uv run uvicorn app.api.app:create_app --factory --port 8000
+curl http://127.0.0.1:8000/health
+# → {"status":"ok","app_env":"development","llm_configured":"false"}
+```
+
+**PostgreSQL 模式**(可选)。前置:本地 Docker 可用;PG 仅监听回环端口,密码在 `.env` 的 `POSTGRES_PASSWORD` 中,由 compose 注入——示例中的 `<密码>` 是占位符,请勿把真实密码写进任何可复制粘贴的文档:
+
+```bash
+docker compose up -d --wait       # postgres:16-alpine @ 127.0.0.1:5432,等待健康检查
+uv run alembic upgrade head       # 迁移 0001 → 0003,幂等
 SUPPORTFLOW_STORE_BACKEND=postgres \
 SUPPORTFLOW_DATABASE_URL=postgresql+psycopg://supportflow:<密码>@127.0.0.1:5432/supportflow \
   uv run python -m app.agent.demo
 ```
 
-## Day 4 状态
+配置项(环境变量,前缀 `SUPPORTFLOW_`,API Key 仅经环境变量注入,日志层对 secret 字段统一脱敏):
 
-已就位:PostgreSQL 持久化层与实机验收。
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SUPPORTFLOW_APP_ENV` | `development` | development / test / production |
+| `SUPPORTFLOW_DEEPSEEK_API_KEY`(或 `DEEPSEEK_API_KEY`) | 空 | DeepSeek API Key;缺失时用确定性离线实现 |
+| `SUPPORTFLOW_DATABASE_URL` | `sqlite:///supportflow.db` | `SUPPORTFLOW_STORE_BACKEND=postgres` 时必须为 `postgresql+psycopg://` |
+| `SUPPORTFLOW_STORE_BACKEND` | `memory` | `memory`(单进程)或 `postgres`(退款链路全落库) |
+| `SUPPORTFLOW_TEST_DATABASE_URL` | 空 | PG 集成测试专用库(库名须以 `_test` 结尾);未设置时集成测试跳过 |
+| `SUPPORTFLOW_MAX_AGENT_ITERATIONS` | `10` | Agent 循环硬上限 |
+| `SUPPORTFLOW_TOOL_TIMEOUT_SECONDS` | `30` | 单次工具调用超时 |
 
-**数据模型与迁移** — 8 表 ORM 模型([app/persistence/models.py](app/persistence/models.py)):orders / tickets / refunds / approvals / plans / agent_runs / audit_events / ticket_notes;Alembic 迁移 [migrations/versions/0001_initial.py](migrations/versions/0001_initial.py) 含 CHECK 约束、`idempotency_key` 唯一约束、同订单至多一笔 PENDING|UNKNOWN 的部分唯一索引 `uq_refunds_order_unresolved`;`upgrade head` 幂等,连跑两次为 no-op。
+## Demo 与预期输出
 
-**PgRefundStore([app/persistence/pg_refund_store.py](app/persistence/pg_refund_store.py))** — 实现 RefundStoreProtocol,与内存版语义逐条对齐:同 key 意图比较先于订单级扫描、余额预检先于 claim、FAILED 释放预留 / UNKNOWN 保留(fail-closed)、同订单至多一笔 PENDING|UNKNOWN、claim 封顶为跨订单聚合不变量(读自锁定工单行,不信任调用方参数)。并发机制:行锁顺序 orders→tickets→refunds、条件 UPDATE 做余额预留、唯一冲突按约束名精确映射(仅两个已知约束名,其余原样抛出)、审计与业务变更同事务。
+### Agent 演示(内存模式,4 场景)
 
-**实机验收** — 22 个集成测试([tests/integration/](tests/integration/))在真实 PostgreSQL 16 上全部通过(连续 4 轮,含 6 个 multiprocessing 双进程竞态测试),Alembic 迁移幂等验证通过,全量单测无回归。实机验收发现并修复 4 个缺陷,其中 2 个并发安全缺陷:①锁后重读返回 identity map 陈旧对象,双进程 finalize 双双结算(修复:FOR UPDATE 重读加 `populate_existing`);②create 拿订单锁后缺幂等键重查,异意图输家被订单门禁抢答为 concurrent(修复:锁后重查,与内存版意图语义对齐)。
+`uv run python -m app.agent.demo` 的实际输出(`REF-`/`RUN-`/`PLAN-` 后为随机 id,每次不同):
 
-**开发数据库** — [compose.yaml](compose.yaml):postgres:16-alpine,仅回环端口 127.0.0.1:5432,凭据来自 .env,数据卷 pgdata,健康检查 pg_isready。集成测试要求专用测试库(库名必须以 `_test` 结尾,否则拒绝运行),每例前 TRUNCATE 清理。
+```
+refundable (low-risk refund)         phase=completed          run=completed          plan=PLAN-… iterations=1
+    reply: Refund of 199.99 USD for order ORD-1001 has been processed. Refund reference: REF-…
+delivered_not_received (first run)   phase=pending_approval   run=awaiting_approval  plan=PLAN-… iterations=0
+delivered_not_received (after APPROVED) phase=completed          run=completed          plan=PLAN-… iterations=1
+    reply: Refund of 129.90 USD for order ORD-1005 has been processed. Refund reference: REF-…
+amount_mismatch (claim > total)      phase=completed          run=completed          plan=-                 iterations=0
+    reply: We could not process this request: the claim exceeds the order total. …
+non_existent (order missing)         phase=completed          run=completed          plan=-                 iterations=0
+    reply: We could not process this request: order ORD-9999 not found. …
+```
 
-未实现(如实说明):DeepSeek 路径未经测试(无真实 API Key,配置后由 [build_llm_collaborators](app/agent/llm.py) 构建);内存后端仍是默认——单进程、**不可跨重启恢复**,外部副作用**非 exactly-once**,靠全意图幂等键 + UNKNOWN 原操作查询语义收敛。
+四个场景依次验证:低风险自动退款 → 高风险暂停等待审批、人工批准后恢复执行 → 索赔超额拒绝 → 订单不存在拒绝。之后打印完整审计轨迹(每次工具调用一行,含 outcome/ticket/run)。PG 模式第二遍运行时,已退款订单被余额门禁拒绝,账务不变(演示持久化)。
 
-## Day 5 状态
+### 崩溃恢复演示(PG 模式,两进程两阶段)
 
-已就位:PostgreSQL 全链路接入——Agent → services → tools 在同一组合入口上使用一致的 Store 依赖。
-
-**后端选择** — `SUPPORTFLOW_STORE_BACKEND=memory|postgres`(默认 memory)。postgres 显式且 fail-loud:URL 非 `postgresql+psycopg://` 时启动即报错;PG 初始化/连接失败直接抛出,**绝不静默回退内存 Store**;wiring 拒绝注入内存 store 内容与注入计划注册表(禁止内存/PG 混用)。
-
-**PG 模式 wiring**([build_agent_wiring](app/agent/runner.py) 为唯一组合入口)— 退款链路全 PG:退款([PgRefundStore](app/persistence/pg_refund_store.py):行锁、条件预留、审计同事务)、订单([PgOrderStore](app/persistence/pg_stores.py) 读穿透——余额只信 PG 行,余额变更方法直接抛错防误用)、计划([PgPlanStore](app/persistence/pg_stores.py),同一内容哈希契约;`refunds.plan_id` 为真实外键,计划必须先注册才能退款)、审计([PgAuditStore](app/persistence/pg_stores.py),graph 级事件落 `audit_events`)、运行([PgAgentRunStore](app/persistence/pg_stores.py),`audit_events.run_id` 为真实外键)。catalog 在 wiring 时幂等 seed([pg_catalog.py](app/persistence/pg_catalog.py),`ON CONFLICT DO NOTHING`,绝不覆盖已变化的账务)。接线时发现并修复 Day 4 遗留缺陷:`agent_runs.status` 列宽 16 放不下 `awaiting_approval`(17 字符),迁移 [0002](migrations/versions/0002_widen_agent_runs_status.py) 加宽(此前集成测试从未把该状态落库,全链路接线后才暴露)。
-
-**真实 PG 验收** — 38 个集成测试全部通过(原 22 + 新增 16):完整 Agent 链路(自动退款、审批两阶段"申请→等待审批→审批后执行"、独立 session 读取、重建 wiring 后状态存在且二次运行被余额门禁拒绝、claim 封顶读自锁定工单行而非调用方参数)、异常结果处理(UNKNOWN 保留预留并经**原操作查询**解决而非重执行、FAILED 释放预留、REJECTED 释放、幂等不重复记账)、并发双线程至多一笔 PENDING、审计事务原子性(审计写失败则退款整体回滚)、审计↔退款引用完整性;部分唯一索引 `uq_refunds_order_unresolved` 直接约束测试(绕过 store 的裸 INSERT 被数据库按约束名拒绝,与 store 业务层拒绝分开验证);Alembic 0001→0002 downgrade/upgrade 往返与幂等;ORM-migration 逐表逐列 schema 一致性检查。
-
-**持久化边界(如实说明)** — 跨进程重启保留:订单、退款、计划、审计事件、运行记录。仍为内存会话状态(重启丢失):工单状态流转、审批记录、工单备注、物流快照——审批丢失的后果 fail-closed:执行前必须重新走完整审批门禁,不可能凭丢失的审批放行。catalog 的 `non_existent` 场景(工单绑定不存在的订单)在 PG 引用完整性下**不可构造**,PG 模式演示跳过该拒绝路径(内存模式保留);对应地,PG 模式对未 seed 工单的运行在首个外键写入处显式失败,不静默降级。
-
-## Day 6 状态
-
-已就位:最小、可重复执行的 UNKNOWN 退款恢复闭环(不建分布式调度,不引入 Redis/队列)。
-
-**网关状态查询协议**([payments.py](app/services/payments.py))— 恢复侧查询只分三类结果 `GatewayQueryResult`:`SUCCEEDED`(网关有明确证据已执行)、`FAILED`(明确证据最终失败且无相同操作在处理中)、`UNKNOWN`(超时、不可用、查询失败、处理中、索引延迟、证据不足——一切非确凿结果必须报 UNKNOWN)。`GatewayQueryError` 表示查询本身失败,对退款结果无任何信息。查询只读、绝不执行;HTTP 层"未找到"不等于失败,由网关契约决定。
-
-**恢复服务**([recovery.py](app/services/recovery.py))— 只查询、无执行路径(结构上不可能二次扣款):扫描 `UNKNOWN`(始终)与孤儿 `PENDING`(超出宽限期,覆盖"网关已执行、本地 finalize 前崩溃"窗口)→ 原子条件 UPDATE 取得租约(owner token + 过期时间,过期只允许再次查询,绝不代表可再次执行)→ 事务外查网关 → 租约守卫下结算:SUCCEEDED 走既有 finalize 等价逻辑(预留转入已退款、审计同事务),FAILED 释放预留,UNKNOWN 保留状态与预留并记录原因。迟到 worker 的过期结果被 owner token 拒绝,无法覆盖新状态;结算本身受行锁 + 状态重查保护,重复运行不重复记账。**数据库事务与外部网关调用不构成原子事务**——靠稳定退款标识(执行前已落库的 refund_id,即网关查询键)、同操作查询和条件更新控制风险;若网关无幂等窗口,执行侧崩溃窗口的二次执行风险属原执行路径与网关契约的边界(见 Day 5/6 报告说明)。schema 新增 4 个恢复字段([迁移 0003](migrations/versions/0003_add_refund_recovery_columns.py):租约 owner/过期、尝试计数、最近错误),无第二套状态机:恢复只复用 `PROCESSED/FAILED/UNKNOWN`。
-
-**崩溃恢复演示**([recovery_demo.py](app/recovery_demo.py))— 两进程两阶段,可重复:
+模拟「网关已执行退款、应用在 finalize 前崩溃」的窗口:
 
 ```bash
-docker compose exec postgres createdb -U supportflow supportflow_demo   # 一次性演示库(可 drop 重来)
+docker compose exec postgres createdb -U supportflow supportflow_demo   # 一次性演示库,可 drop 重来
 SUPPORTFLOW_STORE_BACKEND=postgres \
 SUPPORTFLOW_DATABASE_URL=postgresql+psycopg://supportflow:<密码>@127.0.0.1:5432/supportflow_demo \
   uv run alembic upgrade head
-# 阶段 1:创建退款(PENDING、预留 50.00),网关记账成功,进程在 finalize 前"崩溃"
 SUPPORTFLOW_STORE_BACKEND=postgres \
 SUPPORTFLOW_DATABASE_URL=postgresql+psycopg://supportflow:<密码>@127.0.0.1:5432/supportflow_demo \
   uv run python -m app.recovery_demo --phase crash
-# 阶段 2:新进程重建 wiring,恢复服务识别原操作并安全 finalize;第二次运行金额不变
 SUPPORTFLOW_STORE_BACKEND=postgres \
 SUPPORTFLOW_DATABASE_URL=postgresql+psycopg://supportflow:<密码>@127.0.0.1:5432/supportflow_demo \
   uv run python -m app.recovery_demo --phase recover
 ```
 
-演示使用 [FakeGateway](app/services/payments.py)(内存账本 + JSON 文件模拟网关跨崩溃存活),**仅用于开发与测试,不是真实支付网关**;真实网关行为(查询语义、幂等窗口、最终一致性保证)尚未验证。
+阶段 1(`--phase crash`)实际输出:创建退款行(PENDING、预留 50.00),替身网关记账成功,进程在 finalize 前退出;网关状态经 JSON 账本文件跨「崩溃」存活。
 
-## 安装与配置
-
-```bash
-uv sync
-cp .env.example .env   # 缺少 API Key 时一切照常离线运行
+```
+phase crash: refund REF-… created (PENDING, reserved 50.00)
+  gateway executed successfully; application crashed before finalize
+  gateway ledger written to demo_gateway_ledger.json
 ```
 
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `SUPPORTFLOW_APP_ENV` | `development` | development / test / production |
-| `SUPPORTFLOW_LOG_LEVEL` | `INFO` | 结构化 JSON 日志级别 |
-| `SUPPORTFLOW_DEEPSEEK_API_KEY`(或 `DEEPSEEK_API_KEY`) | 空 | DeepSeek API Key(可选;缺失时用离线默认实现) |
-| `SUPPORTFLOW_DEEPSEEK_MODEL`(或 `DEEPSEEK_MODEL`) | `deepseek-chat` | 使用的模型名 |
-| `SUPPORTFLOW_DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 地址 |
-| `SUPPORTFLOW_DATABASE_URL` | `sqlite:///supportflow.db` | 应用数据库;`SUPPORTFLOW_STORE_BACKEND=postgres` 时必须为 `postgresql+psycopg://`,否则启动报错 |
-| `SUPPORTFLOW_STORE_BACKEND` | `memory` | `memory`(默认,单进程)或 `postgres`(退款链路全 PG,见 Day 5 状态) |
-| `SUPPORTFLOW_TEST_DATABASE_URL` | 空 | PG 集成测试专用库(库名须以 `_test` 结尾);未设置时集成测试跳过 |
-| `SUPPORTFLOW_MAX_AGENT_ITERATIONS` | `10` | Agent 循环硬上限 |
-| `SUPPORTFLOW_TOOL_TIMEOUT_SECONDS` | `30` | 单次工具调用超时 |
+阶段 2(`--phase recover`,新进程)实际输出:恢复服务发现该行、查询原操作、凭证据结算;第二次运行发现 0 行,金额不再移动。
 
-安全约定:API Key 只通过环境变量注入,禁止写入源码或日志;日志层对 secret 类字段统一脱敏。
-
-PG 后端启动与迁移:
-
-```bash
-docker compose up -d --wait          # 本地 PG(仅回环 127.0.0.1:5432),凭据来自 .env
-uv run alembic upgrade head          # 建表/升级(0001 → 0002,幂等;downgrade 可回退)
+```
+recovery run 1: discovered=1 settled_processed=1 settled_failed=0 kept_unknown=0
+  REF-…: settled_processed (gateway succeeded)
+  after recovery: status=processed refunded=50.00 reserved=0.00
+recovery run 2: discovered=0 settled_processed=0 kept_unknown=0
+  after second run: status=processed refunded=50.00 reserved=0.00
 ```
 
 ## 测试
 
 ```bash
-uv run pytest          # 262 个单元/图测试,不依赖网络与真实 LLM
+uv run pytest          # 单元/图测试:262 个,不依赖网络与真实 LLM
 ```
 
-PG 集成测试(51 个,含双进程竞态、Day 5 全链路与 Day 6 恢复闭环)需要本地 PostgreSQL 与专用测试库:
+PG 集成测试(51 个)需要本地 PostgreSQL 与专用测试库:
 
 ```bash
-docker compose up -d --wait   # 启动本地 PG(仅回环),等待健康检查
+docker compose up -d --wait
 docker compose exec postgres createdb -U supportflow supportflow_test
 SUPPORTFLOW_TEST_DATABASE_URL=postgresql+psycopg://supportflow:<密码>@127.0.0.1:5432/supportflow_test \
   uv run pytest tests/integration -q
 ```
 
-测试不依赖真实 LLM、真实退款或网络(262 个测试,0 skip;集成测试未设置 `SUPPORTFLOW_TEST_DATABASE_URL` 时跳过,库名不以 `_test` 结尾时直接失败,防止误连开发/生产库)。Day 3 场景断言实际工具调用次数、退款记录、余额、审批状态、工单状态与审计结果,而不只是回复文本;含静态守卫:Agent 源码不得引用 `ApprovalStatus.APPROVED`、`decide` 或直接修改退款状态。P1 加固回归([tests/test_p1_fixes.py](tests/test_p1_fixes.py))覆盖:哈希缺失审批 fail-closed(图 + 服务边界)、服务层独立风险审批规则(HIGH/CRITICAL 无审批拒绝、伪造低风险审批拒绝)、工单索赔封顶(并发双跑至多一笔、已结算未 RESOLVED 重跑不再退款、UNKNOWN 门禁保持、不同工单互不影响)。第二轮复审回归([tests/test_review2_fixes.py](tests/test_review2_fixes.py))覆盖:FAILED 退款同键重试在原子临界区内重查工单索赔额度(额度被占后拒绝且不预留、不触达网关;额度空闲时复用原记录重试成功)、相同 requested_at 审批的确定性排序规则(后插入者胜,服务层与审批服务共用)、请求审批节点经 `load_verified` 加载计划(漂移 fail-closed)、工单状态原子条件转换(失败运行无法把已 RESOLVED 工单拉回 IN_PROGRESS)。
+设计约定:测试不依赖真实 LLM、真实退款或网络;未设置 `SUPPORTFLOW_TEST_DATABASE_URL` 时集成测试跳过,库名不以 `_test` 结尾时直接失败(防止误连开发库)。
 
-## 模拟数据
+### 实际测试结果(2026-10-11 实测)
 
-[app/persistence/mock_catalog.py](app/persistence/mock_catalog.py) 提供 6 个确定性场景,全部为硬编码常量(无随机、无系统时钟):
+| 套件 | 命令 | 结果 |
+| --- | --- | --- |
+| 单元/图测试 | `uv run pytest` | **262 passed**;51 个集成测试因未设置 PG 测试库而 skipped(设计行为) |
+| PG 集成测试 | 设置 `SUPPORTFLOW_TEST_DATABASE_URL` 后 `uv run pytest tests/integration -q` | **51 passed**(真实 PostgreSQL 16;含 `multiprocessing` spawn 双进程竞态、约束直测、恢复闭环、审计原子性故障注入) |
+| 8 条业务路径抽查 | 指定 12 个测试 id 重跑 | **12 passed**(正常退款、超额拒绝、幂等重放、审批两阶段、UNKNOWN 收敛、崩溃窗口恢复、双 worker 恰一次、重启后状态重建) |
+| API smoke test | `uvicorn app.api.app:create_app --factory` + `GET /health` | 200,`{"status":"ok",…}` |
+| Agent demo / 恢复 demo | 见上文两节 | 输出与预期一致;恢复 demo 二跑金额不变 |
 
-| 场景 | 形态 |
-| --- | --- |
-| `refundable` | 已签收订单,尚未退款 |
-| `already_refunded` | 已签收订单,已全额退款 |
-| `cancelled` | 发货前取消的订单 |
-| `amount_mismatch` | 工单索赔金额高于订单总额 |
-| `delivered_not_received` | 物流显示已签收,客户称未收到(高风险,需审批) |
-| `non_existent` | 工单引用的订单号不存在 |
+## 已知限制与未验证项(如实说明)
 
-```bash
-uv run python -m app.persistence.mock_catalog
-```
+- **退款为模拟操作**。[FakeGateway](app/services/payments.py) 是带账本的确定性替身,仅用于开发、测试与演示,**不是真实支付网关**;真实网关的状态查询契约(SUCCEEDED/FAILED/UNKNOWN 三分类的准确性)、幂等窗口、最终一致性尚未验证(当前无网关凭证/测试环境)。
+- **执行侧崩溃窗口**。恢复服务保证「不盲目二次执行」,但若真实网关自身无幂等键支持,`create`(落库)与 `execute`(网关)之间崩溃后的重试语义取决于原执行路径与网关契约——数据库事务与外部网关调用不构成原子事务,本项目对此不做虚假承诺。
+- **内存后端是默认**,单进程、不可跨重启恢复;跨重启的恢复闭环只在 PostgreSQL 后端存在。
+- **DeepSeek 路径未经真实调用测试**(无 API Key);所有断言基于离线确定性协作者。
+- PG 模式下工单状态流转、审批记录、工单备注仍为内存会话状态(重启丢失);丢失后果 fail-closed:执行前必须重新走完整审批门禁。
+- 长期 UNKNOWN 的退款会按租约周期反复查询(每次一个只读查询),无自动告警或死信机制;运营侧需自行监控 `last_recovery_error`。
+- 无分布式调度:恢复需外部触发(定时调用 `RecoveryService.recover_once()`,如 cron)。
+- HTTP API 目前仅 `/health`,无退款业务端点。
+- 环境步骤未在全新机器验证:uv 的安装、Docker 的安装与镜像拉取在本机环境已具备,未在全新机器上从头走通;除此之外的步骤(依赖同步、迁移、测试、demo)均已实机执行。
 
 ## 项目结构
 
 ```
 app/
-├── __init__.py
-├── config.py            # Settings(env 前缀 SUPPORTFLOW_)
+├── config.py            # Settings(env 前缀 SUPPORTFLOW_,secret 脱敏)
 ├── logging_config.py    # 结构化 JSON 日志 + 密钥脱敏
-├── api/                 # FastAPI 工厂(目前仅 /health)
+├── api/app.py           # FastAPI 工厂(create_app,/health)
 ├── agent/
-│   ├── state.py         # AgentState(TypedDict)与阶段常量
+│   ├── state.py         # AgentState 与阶段常量
 │   ├── graph.py         # LangGraph 图:节点、条件路由、有界循环
-│   ├── llm.py           # 分类/计划/回复接口 + 离线默认实现 + DeepSeek 实现
-│   ├── runner.py        # build_agent_wiring / run_ticket(RunOutcome)
-│   └── demo.py          # 确定性端到端演示(离线)
+│   ├── llm.py           # 分类/计划/回复接口 + 离线默认 + DeepSeek 实现
+│   ├── runner.py        # build_agent_wiring / run_ticket(迭代硬上限)
+│   └── demo.py          # 确定性端到端演示(4 场景,离线)
 ├── recovery_demo.py     # 崩溃恢复两阶段演示(--phase crash|recover,仅 PG)
-├── domain/              # 枚举、金额规则、Pydantic 模型(不依赖任何框架)
+├── domain/              # 枚举、金额规则(Decimal)、Pydantic 模型
 ├── persistence/
-│   ├── base.py          # SQLAlchemy Base
-│   ├── memory_stores.py # 内存存储:锁保护的原子操作(运行时默认)
-│   ├── refund_store.py  # RefundStoreProtocol + 创建结果类型(11 种 kind)
-│   ├── models.py        # 8 表 ORM 模型(FK/CHECK/部分唯一索引)
-│   ├── pg_refund_store.py  # PostgreSQL 退款存储:行锁 + 条件更新 + 审计同事务
-│   ├── db.py            # engine/session 工厂(按 URL 方言选择,失败不静默回退)
-│   ├── pg_stores.py     # PG 订单/计划/审计/运行存储(订单读穿透,余额变更抛错)
-│   ├── pg_catalog.py    # PG 模式 catalog:幂等 seed(ON CONFLICT DO NOTHING)
-│   └── mock_catalog.py  # 6 个确定性模拟场景
+│   ├── memory_stores.py     # 内存 Store:锁保护原子操作(默认运行时)
+│   ├── refund_store.py      # RefundStoreProtocol + 创建结果类型
+│   ├── models.py            # 8 表 ORM 模型(FK/CHECK/部分唯一索引)
+│   ├── pg_refund_store.py   # PG 退款存储:行锁 + 条件更新 + 审计同事务 + 恢复租约
+│   ├── db.py                # engine/session 工厂(方言选择,失败不静默回退)
+│   ├── pg_stores.py         # PG 订单/计划/审计/运行存储
+│   ├── pg_catalog.py        # PG catalog 幂等 seed(ON CONFLICT DO NOTHING)
+│   └── mock_catalog.py      # 6 个确定性模拟场景
 ├── services/
 │   ├── refund_policy.py # 结构化退款政策(纯函数,默认拒绝)
-│   ├── payments.py      # 模拟支付网关(可注入失败/未知结果)
-│   ├── refunds.py       # 退款安全边界:校验、审批门禁(含计划哈希复核)、幂等
+│   ├── payments.py      # 模拟支付网关 + 查询协议 + FakeGateway 替身
+│   ├── refunds.py       # 退款安全边界:校验、审批门禁、幂等、结果核验
 │   ├── plans.py         # PlanStore:内容哈希、同 id 异内容拒绝、读取重算
 │   ├── approvals.py     # ApprovalService:请求去重、decide(人工侧入口)
-│   ├── recovery.py      # UNKNOWN 退款恢复服务:租约、网关查询、租约守卫结算
+│   ├── recovery.py      # UNKNOWN 恢复:租约、只读查询、租约守卫结算
 │   └── audit.py         # 审计事件记录器
 └── tools/
-    ├── result.py        # ToolResult 统一结果信封 + ToolErrorCode
+    ├── result.py        # ToolResult 统一结果信封
     ├── context.py       # ToolContext(工单/运行上下文)
     ├── schemas.py       # 工具输入模型(Pydantic 校验)
     ├── audit.py         # audited 装饰器(审计 + 异常收敛)
-    └── registry.py      # ToolSet + build_default_tool_set(唯一工具注册入口)
+    └── registry.py      # ToolSet + build_default_tool_set(唯一注册入口)
 tests/
-├── fixtures/mock_data.py  # 向后兼容再导出(app.persistence.mock_catalog)
-├── tools_util.py          # 构建注入式 ToolSet 的测试辅助
-├── test_plan_store.py     # PlanStore:哈希确定性、幂等重注册、漂移检测
-├── test_approval_service.py  # ApprovalService:绑定、去重、decide 契约、审计
-├── test_agent_day3.py     # 图行为 16 场景 + 静态守卫(断言状态而非文本)
-├── test_day4_batch1.py    # Day 4 批 1:PG 模型/迁移/会话工厂契约
-├── test_day5_wiring.py    # Day 5 wiring 单测:后端选择、fail-loud、注入拒绝(不连库)
-├── test_recovery_unit.py  # Day 6 恢复决策/网关映射/服务流控单测(不连库)
-├── integration/           # PG 集成测试(51 个:竞态 + 全链路/约束/schema + 恢复闭环)
-└── test_*.py              # Day 1-2 的领域/工具/审计测试
-migrations/                # Alembic:0001(8 表)+ 0002 加宽 status + 0003 恢复租约字段,upgrade 幂等
-compose.yaml               # 本地开发 PostgreSQL(postgres:16-alpine,仅回环)
+├── test_agent_day3.py   # 图行为场景 + 静态守卫(断言状态而非文本)
+├── test_p1_fixes.py     # P1 加固回归:审批 fail-closed、索赔封顶
+├── test_review2_fixes.py# 复审回归:同键重试重查额度、审批排序、计划漂移
+├── test_recovery_unit.py# 恢复决策/网关映射/服务流控单测(不连库)
+├── integration/         # PG 集成测试 51 个:双进程竞态、全链路、约束、恢复闭环
+└── test_*.py            # Day 1-2 领域/工具/审计测试
+migrations/              # Alembic:0001(8 表)→ 0002(加宽 status)→ 0003(恢复租约字段)
+compose.yaml             # 本地开发 PostgreSQL(postgres:16-alpine,仅回环)
 ```
+
+## 开发历史(压缩)
+
+- **Day 1**:领域模型与枚举、金额规则(Decimal)、统一 ToolResult、配置(SecretStr)、结构化日志(脱敏)、6 个确定性模拟场景。
+- **Day 2**:5 个业务工具(订单/物流/政策/退款/备注);退款服务端全量校验,不信任 LLM;模拟网关三类非成功结果(REJECTED / 确认未执行 / UNKNOWN),UNKNOWN 保留预留且必须先查原操作;审计每次工具调用。
+- **Day 3**:LangGraph 固定图(模型不选工具);LLM 只提计划提议,服务端注册计划(内容 SHA-256)并绑定审批;高风险暂停 → 人工决定 → 重跑时复用审批绑定计划并重验(状态/有效期/哈希);执行后经持久化记录核验;工单级索赔封顶。
+- **Day 4**:PostgreSQL 8 表 ORM + Alembic 迁移(显式命名全部约束);PgRefundStore 与内存版语义逐条对齐;22 个集成测试实机通过;实机验收发现并修复 2 个并发缺陷(锁后陈旧读、锁后幂等键重查)。
+- **Day 5**:PG 全链路接线(Agent→services→tools 同一 Store 依赖);后端显式选择、无静默回退;38 个集成测试(含双进程竞态、审计原子性、约束直测)。
+- **Day 6**:UNKNOWN 恢复闭环——三类查询协议、租约(原子条件 UPDATE)、只查询无执行的恢复服务、崩溃窗口覆盖;4 个恢复字段迁移(0003);两进程崩溃恢复演示;262 单测 + 51 集成。
+- **Day 7**(本次):作品集交付——8 条业务路径实机取证、安全不变量源码级审查、干净环境启动路径核对、本 README 重构(架构图/流程图/状态机/不变量/实测结果)、安全与交付检查。
