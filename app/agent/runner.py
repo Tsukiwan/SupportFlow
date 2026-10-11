@@ -123,19 +123,56 @@ def build_agent_wiring(
 ) -> AgentDependencies:
     """Assemble dependencies over the deterministic mock catalog (or
     injected stores for tests). Uses the production ToolSet construction —
-    the same registry the tool layer exposes."""
+    the same registry the tool layer exposes.
+
+    Backend selection is explicit via ``settings.store_backend``:
+
+    - ``memory`` (default) — the in-memory stores; unit tests inject
+      custom store contents through ``orders``/``tickets``/``shipments``;
+    - ``postgres`` — every refund-chain store is PostgreSQL-backed, the
+      catalog is seeded first (idempotent), and a connection failure
+      raises — there is no silent fallback to memory. Injected store
+      contents and injected plan stores are memory-mode paths and are
+      refused here so the backends can never mix."""
     settings = settings or get_settings()
+    pg_mode = settings.store_backend == "postgres"
+    if pg_mode and (orders is not None or tickets is not None or shipments is not None):
+        raise TypeError(
+            "injected store contents are a memory-mode test path; the "
+            "postgres backend owns its catalog"
+        )
+    if pg_mode and plans is not None:
+        raise TypeError(
+            "postgres backend owns the plan registry (plans.plan_id is a "
+            "foreign key); pass plans=None"
+        )
+
     # One PlanStore shared by the graph and RefundService: approvals are
     # re-verified against the same registry the agent registers plans into.
-    plan_store = plans or PlanStore()
-    tools = (
-        build_default_tool_set(gateway=gateway, plans=plan_store)
-        if orders is None and tickets is None and shipments is None
-        else _tool_set_with_injected_data(
-            gateway=gateway, orders=orders, tickets=tickets,
-            shipments=shipments, plans=plan_store,
+    if pg_mode:
+        from app.persistence.db import build_engine, build_session_factory
+        from app.persistence.pg_catalog import ensure_catalog_seeded
+        from app.persistence.pg_stores import PgAgentRunStore, PgPlanStore
+        from app.tools.registry import build_pg_tool_set
+
+        session_factory = build_session_factory(build_engine(settings))
+        ensure_catalog_seeded(session_factory)
+        plan_store = PgPlanStore(session_factory)
+        tools = build_pg_tool_set(
+            session_factory=session_factory, plans=plan_store, gateway=gateway
         )
-    )
+        run_store = PgAgentRunStore(session_factory)
+    else:
+        plan_store = plans or PlanStore()
+        tools = (
+            build_default_tool_set(gateway=gateway, plans=plan_store)
+            if orders is None and tickets is None and shipments is None
+            else _tool_set_with_injected_data(
+                gateway=gateway, orders=orders, tickets=tickets,
+                shipments=shipments, plans=plan_store,
+            )
+        )
+        run_store = AgentRunStore()
     recorder = AuditRecorder(tools.audit_store)
     approval_service = ApprovalService(store=tools.approvals, recorder=recorder)
     llm_classifier = llm_planner = llm_reply = None
@@ -146,7 +183,7 @@ def build_agent_wiring(
         tools=tools,
         plans=plan_store,
         approvals=approval_service,
-        runs=AgentRunStore(),
+        runs=run_store,
         recorder=recorder,
         classifier=classifier or llm_classifier,
         planner=planner or llm_planner,

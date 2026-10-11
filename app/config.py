@@ -12,7 +12,7 @@ API key and model, so a hand-written ``.env`` with bare names works too.
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,11 +44,18 @@ class Settings(BaseSettings):
         validation_alias="SUPPORTFLOW_DEEPSEEK_BASE_URL",
     )
 
-    # SQLite default keeps local dev dependency-free; PostgreSQL lands with
-    # the persistence layer on a later day.
+    # SQLite default keeps local dev dependency-free; the postgres backend
+    # lands with the persistence layer (Day 4/5).
     database_url: str = Field(
         default="sqlite:///supportflow.db",
         validation_alias="SUPPORTFLOW_DATABASE_URL",
+    )
+
+    # Which store backend the agent runs on. "postgres" is explicit and
+    # fail-loud: it requires a PostgreSQL URL and never falls back to the
+    # in-memory stores (see ``_validate_store_backend``).
+    store_backend: Literal["memory", "postgres"] = Field(
+        default="memory", validation_alias="SUPPORTFLOW_STORE_BACKEND"
     )
 
     # Agent guardrails.
@@ -58,6 +65,19 @@ class Settings(BaseSettings):
     tool_timeout_seconds: float = Field(
         default=30.0, gt=0, validation_alias="SUPPORTFLOW_TOOL_TIMEOUT_SECONDS"
     )
+
+    @model_validator(mode="after")
+    def _validate_store_backend(self) -> "Settings":
+        # Choosing postgres is explicit; a mismatched URL is a configuration
+        # error raised at startup — never a silent fallback to memory.
+        if self.store_backend == "postgres" and not self.database_url.startswith(
+            "postgresql+psycopg://"
+        ):
+            raise ValueError(
+                "store_backend=postgres requires a PostgreSQL database_url "
+                "(postgresql+psycopg://...); refusing to mix backends"
+            )
+        return self
 
     @property
     def has_deepseek_key(self) -> bool:

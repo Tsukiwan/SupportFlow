@@ -21,6 +21,7 @@ from app.agent.llm import (
     DefaultReplyGenerator,
 )
 from app.agent.runner import build_agent_wiring, run_ticket
+from app.config import get_settings
 from app.domain.enums import ApprovalStatus
 
 
@@ -32,6 +33,14 @@ async def _demo() -> None:
         planner=DefaultPlanProposer(),
         reply_generator=DefaultReplyGenerator(),
     )
+    pg_mode = get_settings().store_backend == "postgres"
+    if pg_mode:
+        print(
+            "backend: postgres — the non_existent scenario is not run: "
+            "its ticket binds an order that does not exist, which "
+            "PostgreSQL referential integrity cannot represent (memory "
+            "mode keeps that rejection path; see README).\n"
+        )
 
     # 1. Low-risk refund request: full automatic pipeline.
     outcome = await run_ticket("TKT-2001", deps)
@@ -57,9 +66,11 @@ async def _demo() -> None:
     outcome = await run_ticket("TKT-2004", deps)
     _print("amount_mismatch (claim > total)", outcome)
 
-    # 4. Order does not exist: refused, no side effects.
-    outcome = await run_ticket("TKT-2006", deps)
-    _print("non_existent (order missing)", outcome)
+    # 4. Order does not exist: refused, no side effects. Not representable
+    #    under PG referential integrity — memory mode only (see above).
+    if not pg_mode:
+        outcome = await run_ticket("TKT-2006", deps)
+        _print("non_existent (order missing)", outcome)
 
     print("\nAudit trail (action, outcome, ticket, run):")
     for event in deps.tools.audit_store.all():

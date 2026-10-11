@@ -444,6 +444,38 @@ class PgRefundStore:
                 return gate
             return "concurrent", None
 
+    # ------------------------------------------------------------------
+    # plain reads
+    # ------------------------------------------------------------------
+
+    def get(self, refund_id: str) -> Refund | None:
+        """Read one refund by id in a fresh, short transaction. No lock."""
+        with session_scope(self._sessions) as s:
+            row = self._by_id(s, refund_id)
+            return self._to_domain(row) if row is not None else None
+
+    def get_by_key(self, idempotency_key: str) -> Refund | None:
+        """Read the refund an idempotency key resolves to (None if unused)."""
+        with session_scope(self._sessions) as s:
+            row = self._by_key(s, idempotency_key)
+            return self._to_domain(row) if row is not None else None
+
+    def all(self) -> tuple[Refund, ...]:
+        """Every refund, oldest first (creation order)."""
+        with session_scope(self._sessions) as s:
+            rows = (
+                s.execute(
+                    select(RefundRow).order_by(RefundRow.created_at)
+                )
+                .scalars()
+                .all()
+            )
+            return tuple(self._to_domain(row) for row in rows)
+
+    def count(self) -> int:
+        with session_scope(self._sessions) as s:
+            return s.scalar(select(func.count()).select_from(RefundRow)) or 0
+
     def _reopen_in_session(
         self, s: Session, *, refund_id: str
     ) -> tuple[

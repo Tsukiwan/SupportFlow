@@ -21,6 +21,7 @@ from app.persistence.memory_stores import (
     TicketNoteStore,
     TicketStore,
 )
+from app.persistence.pg_stores import PgAuditStore, PgOrderStore, PgPlanStore
 from app.persistence.refund_store import RefundStoreProtocol
 from app.services.audit import AuditRecorder
 from app.services.payments import PaymentGateway, SimulatedPaymentGateway
@@ -189,6 +190,43 @@ def build_default_tool_set(
     return ToolSet(
         orders=OrderStore(build_orders_by_id()),
         refunds=RefundStore(),
+        shipments=ShippingStore(build_shipments_by_order_id()),
+        tickets=TicketStore(build_tickets_by_id()),
+        notes=TicketNoteStore(),
+        approvals=ApprovalStore(),
+        gateway=gateway or SimulatedPaymentGateway(),
+        recorder=recorder,
+        plans=plans,
+    )
+
+
+def build_pg_tool_set(
+    *,
+    session_factory,
+    plans: PgPlanStore,
+    gateway: PaymentGateway | None = None,
+) -> ToolSet:
+    """Assemble a tool set over PostgreSQL.
+
+    Refund-chain state (orders, refunds, plans, audit) is PG-backed and
+    shared with the agent graph; workflow state (tickets, notes,
+    shipments, approvals) is the in-memory catalog — a ticket can never
+    be in two places at once, and the refund store's foreign keys require
+    the PG catalog to be seeded first (``ensure_catalog_seeded``).
+
+    ``plans`` is required for the same reason as
+    :func:`build_default_tool_set`: approvals are re-verified against the
+    trusted registry, and ``refunds.plan_id`` is a real foreign key."""
+    from app.persistence.mock_catalog import (
+        build_shipments_by_order_id,
+        build_tickets_by_id,
+    )
+    from app.persistence.pg_refund_store import PgRefundStore
+
+    recorder = AuditRecorder(PgAuditStore(session_factory))
+    return ToolSet(
+        orders=PgOrderStore(session_factory),
+        refunds=PgRefundStore(session_factory),
         shipments=ShippingStore(build_shipments_by_order_id()),
         tickets=TicketStore(build_tickets_by_id()),
         notes=TicketNoteStore(),

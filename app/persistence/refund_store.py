@@ -1,8 +1,8 @@
 """Shared refund-store contract for the in-memory and PostgreSQL stores.
 
-Both implementations expose the same three operations with the same
-signatures, return types and state-machine semantics, so the service
-layer can take either without branching.
+Both implementations expose the same three write operations (plus plain
+reads) with the same signatures, return types and state-machine
+semantics, so the service layer can take either without branching.
 
 ``orders`` is part of the contract for interface parity: the in-memory
 store needs the live :class:`~app.persistence.memory_stores.OrderStore`
@@ -64,3 +64,16 @@ class RefundStoreProtocol(Protocol):
         ],
         Refund | None,
     ]: ...
+
+    # --- plain reads (no locking, no side effects) ---
+    #
+    # The agent graph re-reads persisted state after execution (never
+    # trusting the ToolResult alone), so every backend must expose these.
+
+    def get(self, refund_id: str) -> Refund | None: ...
+
+    def get_by_key(self, idempotency_key: str) -> Refund | None: ...
+
+    def all(self) -> tuple[Refund, ...]: ...
+
+    def count(self) -> int: ...

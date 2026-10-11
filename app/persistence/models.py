@@ -318,7 +318,9 @@ class AgentRunRow(Base):
 
     run_id: Mapped[str] = mapped_column(sa.String(64), primary_key=True)
     ticket_id: Mapped[str] = mapped_column(sa.String(64), nullable=False)
-    status: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    # 32: the longest AgentRunStatus value is "awaiting_approval" (17),
+    # which does not fit the 16-char width of the other status columns.
+    status: Mapped[str] = mapped_column(sa.String(32), nullable=False)
     started_at: Mapped[datetime] = mapped_column(TIMESTAMP, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMP, nullable=True)
     iterations: Mapped[int] = mapped_column(

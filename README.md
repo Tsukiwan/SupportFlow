@@ -39,6 +39,14 @@ AI 客服工单处理 Agent:查询订单、检查退款政策、提出处理方�
 uv run python -m app.agent.demo
 ```
 
+PG 后端演示(需本地 PG 已启动,幂等 seed;第二遍运行演示持久化——已退款订单被余额门禁拒绝,账务不变):
+
+```bash
+SUPPORTFLOW_STORE_BACKEND=postgres \
+SUPPORTFLOW_DATABASE_URL=postgresql+psycopg://supportflow:<密码>@127.0.0.1:5432/supportflow \
+  uv run python -m app.agent.demo
+```
+
 ## Day 4 状态
 
 已就位:PostgreSQL 持久化层与实机验收。
@@ -51,7 +59,19 @@ uv run python -m app.agent.demo
 
 **开发数据库** — [compose.yaml](compose.yaml):postgres:16-alpine,仅回环端口 127.0.0.1:5432,凭据来自 .env,数据卷 pgdata,健康检查 pg_isready。集成测试要求专用测试库(库名必须以 `_test` 结尾,否则拒绝运行),每例前 TRUNCATE 清理。
 
-未实现:Agent 主流程尚未切换到 PG(运行时仍为内存存储:单进程、**不可跨重启恢复**,外部副作用**非 exactly-once**,靠全意图幂等键 + UNKNOWN 原操作查询语义收敛;PG 层已备好,接线切换在后续批次);DeepSeek 路径未经测试(无真实 API Key,配置后由 [build_llm_collaborators](app/agent/llm.py) 构建)。
+未实现(如实说明):DeepSeek 路径未经测试(无真实 API Key,配置后由 [build_llm_collaborators](app/agent/llm.py) 构建);内存后端仍是默认——单进程、**不可跨重启恢复**,外部副作用**非 exactly-once**,靠全意图幂等键 + UNKNOWN 原操作查询语义收敛。
+
+## Day 5 状态
+
+已就位:PostgreSQL 全链路接入——Agent → services → tools 在同一组合入口上使用一致的 Store 依赖。
+
+**后端选择** — `SUPPORTFLOW_STORE_BACKEND=memory|postgres`(默认 memory)。postgres 显式且 fail-loud:URL 非 `postgresql+psycopg://` 时启动即报错;PG 初始化/连接失败直接抛出,**绝不静默回退内存 Store**;wiring 拒绝注入内存 store 内容与注入计划注册表(禁止内存/PG 混用)。
+
+**PG 模式 wiring**([build_agent_wiring](app/agent/runner.py) 为唯一组合入口)— 退款链路全 PG:退款([PgRefundStore](app/persistence/pg_refund_store.py):行锁、条件预留、审计同事务)、订单([PgOrderStore](app/persistence/pg_stores.py) 读穿透——余额只信 PG 行,余额变更方法直接抛错防误用)、计划([PgPlanStore](app/persistence/pg_stores.py),同一内容哈希契约;`refunds.plan_id` 为真实外键,计划必须先注册才能退款)、审计([PgAuditStore](app/persistence/pg_stores.py),graph 级事件落 `audit_events`)、运行([PgAgentRunStore](app/persistence/pg_stores.py),`audit_events.run_id` 为真实外键)。catalog 在 wiring 时幂等 seed([pg_catalog.py](app/persistence/pg_catalog.py),`ON CONFLICT DO NOTHING`,绝不覆盖已变化的账务)。接线时发现并修复 Day 4 遗留缺陷:`agent_runs.status` 列宽 16 放不下 `awaiting_approval`(17 字符),迁移 [0002](migrations/versions/0002_widen_agent_runs_status.py) 加宽(此前集成测试从未把该状态落库,全链路接线后才暴露)。
+
+**真实 PG 验收** — 38 个集成测试全部通过(原 22 + 新增 16):完整 Agent 链路(自动退款、审批两阶段"申请→等待审批→审批后执行"、独立 session 读取、重建 wiring 后状态存在且二次运行被余额门禁拒绝、claim 封顶读自锁定工单行而非调用方参数)、异常结果处理(UNKNOWN 保留预留并经**原操作查询**解决而非重执行、FAILED 释放预留、REJECTED 释放、幂等不重复记账)、并发双线程至多一笔 PENDING、审计事务原子性(审计写失败则退款整体回滚)、审计↔退款引用完整性;部分唯一索引 `uq_refunds_order_unresolved` 直接约束测试(绕过 store 的裸 INSERT 被数据库按约束名拒绝,与 store 业务层拒绝分开验证);Alembic 0001→0002 downgrade/upgrade 往返与幂等;ORM-migration 逐表逐列 schema 一致性检查。
+
+**持久化边界(如实说明)** — 跨进程重启保留:订单、退款、计划、审计事件、运行记录。仍为内存会话状态(重启丢失):工单状态流转、审批记录、工单备注、物流快照——审批丢失的后果 fail-closed:执行前必须重新走完整审批门禁,不可能凭丢失的审批放行。catalog 的 `non_existent` 场景(工单绑定不存在的订单)在 PG 引用完整性下**不可构造**,PG 模式演示跳过该拒绝路径(内存模式保留);对应地,PG 模式对未 seed 工单的运行在首个外键写入处显式失败,不静默降级。
 
 ## 安装与配置
 
@@ -67,20 +87,28 @@ cp .env.example .env   # 缺少 API Key 时一切照常离线运行
 | `SUPPORTFLOW_DEEPSEEK_API_KEY`(或 `DEEPSEEK_API_KEY`) | 空 | DeepSeek API Key(可选;缺失时用离线默认实现) |
 | `SUPPORTFLOW_DEEPSEEK_MODEL`(或 `DEEPSEEK_MODEL`) | `deepseek-chat` | 使用的模型名 |
 | `SUPPORTFLOW_DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API 地址 |
-| `SUPPORTFLOW_DATABASE_URL` | `sqlite:///supportflow.db` | 应用数据库;设为 `postgresql+psycopg://` 走 PG(Agent 接线切换前默认 sqlite) |
+| `SUPPORTFLOW_DATABASE_URL` | `sqlite:///supportflow.db` | 应用数据库;`SUPPORTFLOW_STORE_BACKEND=postgres` 时必须为 `postgresql+psycopg://`,否则启动报错 |
+| `SUPPORTFLOW_STORE_BACKEND` | `memory` | `memory`(默认,单进程)或 `postgres`(退款链路全 PG,见 Day 5 状态) |
 | `SUPPORTFLOW_TEST_DATABASE_URL` | 空 | PG 集成测试专用库(库名须以 `_test` 结尾);未设置时集成测试跳过 |
 | `SUPPORTFLOW_MAX_AGENT_ITERATIONS` | `10` | Agent 循环硬上限 |
 | `SUPPORTFLOW_TOOL_TIMEOUT_SECONDS` | `30` | 单次工具调用超时 |
 
 安全约定:API Key 只通过环境变量注入,禁止写入源码或日志;日志层对 secret 类字段统一脱敏。
 
+PG 后端启动与迁移:
+
+```bash
+docker compose up -d --wait          # 本地 PG(仅回环 127.0.0.1:5432),凭据来自 .env
+uv run alembic upgrade head          # 建表/升级(0001 → 0002,幂等;downgrade 可回退)
+```
+
 ## 测试
 
 ```bash
-uv run pytest          # 233 个单元/图测试,不依赖网络与真实 LLM
+uv run pytest          # 243 个单元/图测试,不依赖网络与真实 LLM
 ```
 
-PG 集成测试(22 个,含双进程竞态)需要本地 PostgreSQL 与专用测试库:
+PG 集成测试(38 个,含双进程竞态与 Day 5 全链路)需要本地 PostgreSQL 与专用测试库:
 
 ```bash
 docker compose up -d --wait   # 启动本地 PG(仅回环),等待健康检查
@@ -89,7 +117,7 @@ SUPPORTFLOW_TEST_DATABASE_URL=postgresql+psycopg://supportflow:<密码>@127.0.0.
   uv run pytest tests/integration -q
 ```
 
-测试不依赖真实 LLM、真实退款或网络(233 个测试,0 skip;集成测试未设置 `SUPPORTFLOW_TEST_DATABASE_URL` 时跳过,库名不以 `_test` 结尾时直接失败,防止误连开发/生产库)。Day 3 场景断言实际工具调用次数、退款记录、余额、审批状态、工单状态与审计结果,而不只是回复文本;含静态守卫:Agent 源码不得引用 `ApprovalStatus.APPROVED`、`decide` 或直接修改退款状态。P1 加固回归([tests/test_p1_fixes.py](tests/test_p1_fixes.py))覆盖:哈希缺失审批 fail-closed(图 + 服务边界)、服务层独立风险审批规则(HIGH/CRITICAL 无审批拒绝、伪造低风险审批拒绝)、工单索赔封顶(并发双跑至多一笔、已结算未 RESOLVED 重跑不再退款、UNKNOWN 门禁保持、不同工单互不影响)。第二轮复审回归([tests/test_review2_fixes.py](tests/test_review2_fixes.py))覆盖:FAILED 退款同键重试在原子临界区内重查工单索赔额度(额度被占后拒绝且不预留、不触达网关;额度空闲时复用原记录重试成功)、相同 requested_at 审批的确定性排序规则(后插入者胜,服务层与审批服务共用)、请求审批节点经 `load_verified` 加载计划(漂移 fail-closed)、工单状态原子条件转换(失败运行无法把已 RESOLVED 工单拉回 IN_PROGRESS)。
+测试不依赖真实 LLM、真实退款或网络(243 个测试,0 skip;集成测试未设置 `SUPPORTFLOW_TEST_DATABASE_URL` 时跳过,库名不以 `_test` 结尾时直接失败,防止误连开发/生产库)。Day 3 场景断言实际工具调用次数、退款记录、余额、审批状态、工单状态与审计结果,而不只是回复文本;含静态守卫:Agent 源码不得引用 `ApprovalStatus.APPROVED`、`decide` 或直接修改退款状态。P1 加固回归([tests/test_p1_fixes.py](tests/test_p1_fixes.py))覆盖:哈希缺失审批 fail-closed(图 + 服务边界)、服务层独立风险审批规则(HIGH/CRITICAL 无审批拒绝、伪造低风险审批拒绝)、工单索赔封顶(并发双跑至多一笔、已结算未 RESOLVED 重跑不再退款、UNKNOWN 门禁保持、不同工单互不影响)。第二轮复审回归([tests/test_review2_fixes.py](tests/test_review2_fixes.py))覆盖:FAILED 退款同键重试在原子临界区内重查工单索赔额度(额度被占后拒绝且不预留、不触达网关;额度空闲时复用原记录重试成功)、相同 requested_at 审批的确定性排序规则(后插入者胜,服务层与审批服务共用)、请求审批节点经 `load_verified` 加载计划(漂移 fail-closed)、工单状态原子条件转换(失败运行无法把已 RESOLVED 工单拉回 IN_PROGRESS)。
 
 ## 模拟数据
 
@@ -130,6 +158,8 @@ app/
 │   ├── models.py        # 8 表 ORM 模型(FK/CHECK/部分唯一索引)
 │   ├── pg_refund_store.py  # PostgreSQL 退款存储:行锁 + 条件更新 + 审计同事务
 │   ├── db.py            # engine/session 工厂(按 URL 方言选择,失败不静默回退)
+│   ├── pg_stores.py     # PG 订单/计划/审计/运行存储(订单读穿透,余额变更抛错)
+│   ├── pg_catalog.py    # PG 模式 catalog:幂等 seed(ON CONFLICT DO NOTHING)
 │   └── mock_catalog.py  # 6 个确定性模拟场景
 ├── services/
 │   ├── refund_policy.py # 结构化退款政策(纯函数,默认拒绝)
@@ -151,8 +181,9 @@ tests/
 ├── test_approval_service.py  # ApprovalService:绑定、去重、decide 契约、审计
 ├── test_agent_day3.py     # 图行为 16 场景 + 静态守卫(断言状态而非文本)
 ├── test_day4_batch1.py    # Day 4 批 1:PG 模型/迁移/会话工厂契约
-├── integration/           # PG 集成测试(22 个,含双进程竞态;需 SUPPORTFLOW_TEST_DATABASE_URL)
+├── test_day5_wiring.py    # Day 5 wiring 单测:后端选择、fail-loud、注入拒绝(不连库)
+├── integration/           # PG 集成测试(38 个:Day 4 双进程竞态 + Day 5 全链路/约束/schema)
 └── test_*.py              # Day 1-2 的领域/工具/审计测试
-migrations/                # Alembic:0001_initial(8 表),upgrade 幂等
+migrations/                # Alembic:0001_initial(8 表)+ 0002 加宽 agent_runs.status,upgrade 幂等
 compose.yaml               # 本地开发 PostgreSQL(postgres:16-alpine,仅回环)
 ```
